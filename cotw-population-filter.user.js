@@ -262,7 +262,6 @@
         .cotw-range > div { flex: 1; }
         #cotw-status { margin-top: 8px; font-size: 12px; color: #9fd3a4; min-height: 1.2em; word-break: break-all; }
         #cotw-area-info { margin-top: 10px; padding-top: 8px; border-top: 1px solid #566; }
-        #cotw-area-title { color: #ddd; font-weight: 600; }
         #cotw-area-results { max-height: 220px; overflow-y: auto; margin-top: 4px; user-select: text; }
         .cotw-area-empty { color: #aaa; font-size: 12px; }
         .cotw-area-group { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.12); }
@@ -291,8 +290,7 @@
             <button id="cotw-apply">筛选并勾选</button>
             <button id="cotw-clear" class="cotw-secondary">全部取消</button>
             <div id="cotw-status"></div>
-            <div id="cotw-area-info">
-                <div id="cotw-area-title">点击地图区域查看个体分数</div>
+            <div id="cotw-area-info" hidden>
                 <div id="cotw-area-results"></div>
             </div>
         </div>
@@ -307,6 +305,7 @@
     const btnApply = $('#cotw-apply', panel);
     const btnClear = $('#cotw-clear', panel);
     const status = $('#cotw-status', panel);
+    const areaInfo = $('#cotw-area-info', panel);
     const areaResults = $('#cotw-area-results', panel);
 
     // —— 拖拽 / 折叠 ——
@@ -366,7 +365,7 @@
     // —— 地图点击区域的个体分数 ——
 
     let selectedAreaEntries = [];
-    let areaEmptyText = '点击地图上的种群区域查看兽群个体分数';
+    let areaEmptyText = '';
 
     function formatAreaTime(hours) {
         const minutes = Math.trunc(hours * 60);
@@ -436,11 +435,14 @@
 
     function renderSelectedArea() {
         areaResults.replaceChildren();
+        areaInfo.hidden = selectedAreaEntries.length === 0 && !areaEmptyText;
         if (selectedAreaEntries.length === 0) {
-            const empty = document.createElement('div');
-            empty.className = 'cotw-area-empty';
-            empty.textContent = areaEmptyText;
-            areaResults.appendChild(empty);
+            if (areaEmptyText) {
+                const empty = document.createElement('div');
+                empty.className = 'cotw-area-empty';
+                empty.textContent = areaEmptyText;
+                areaResults.appendChild(empty);
+            }
             return;
         }
 
@@ -682,7 +684,7 @@
         attachedMaps.add(pageMap);
 
         selectedAreaEntries = [];
-        areaEmptyText = '点击地图上的种群区域查看兽群个体分数';
+        areaEmptyText = '';
         renderSelectedArea();
 
         // 独立监听页面地图事件；不覆盖原有点击处理器或 map_info 内容。
