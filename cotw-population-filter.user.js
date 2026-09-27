@@ -65,7 +65,7 @@
 
     // —— 个体分数捕获 ——
     // 页面解析存档时个体 Score 算完 max 即被丢弃，这里挂钩子留存。
-    // 组编号与页面一致：同一 (物种, 出生区) 内按存档组序 0,1,2...
+    // group_index 按页面实际生成的地图组编号计算，跳过不会生成图层的原始群。
 
     const scoresByReserve = new Map(); // reserveId -> Map<key, number[]>
     const keyOf = (name, spawnAreaId, groupIndex) => `${name}|${spawnAreaId}|${groupIndex}`;
@@ -90,35 +90,97 @@
         return null;
     }
 
+    let groupMappingWarningShown = false;
+
+    function warnGroupMappingFailure(error) {
+        if (groupMappingWarningShown) return;
+        groupMappingWarningShown = true;
+        console.warn('[COTW 种群分数筛选] 无法对齐页面兽群编号，相关兽群将回退到最高分筛选。', error);
+    }
+
+    function pageGroupIndices(population, reserveArea, spawnPointsByArea) {
+        try {
+            const groupToWarrenId = population.GroupToWarrenId;
+            const nextIndexByArea = new Map();
+            const pageIndexBySourceIndex = new Map();
+
+            for (const [sourceIndex, group] of Object.entries(population.Groups ?? {})) {
+                const spawnAreaId = String(group.SpawnAreadId);
+                if (!Object.prototype.hasOwnProperty.call(reserveArea, spawnAreaId)) continue;
+
+                let isRendered;
+                if (groupToWarrenId?.length > 0) {
+                    const spawnPoints = spawnPointsByArea[spawnAreaId];
+                    const pointId = String(groupToWarrenId[sourceIndex]);
+                    isRendered = spawnPoints?.[pointId] !== undefined;
+                } else {
+                    const needZoneIds = new Int32Array(group.NeedZonePathGuids ?? []);
+                    isRendered = [...needZoneIds].some((id) =>
+                        id !== -1 && Object.prototype.hasOwnProperty.call(reserveArea, id));
+                }
+
+                if (!isRendered) continue;
+                const pageIndex = nextIndexByArea.get(spawnAreaId) ?? 0;
+                pageIndexBySourceIndex.set(sourceIndex, pageIndex);
+                nextIndexByArea.set(spawnAreaId, pageIndex + 1);
+            }
+            return pageIndexBySourceIndex;
+        } catch (error) {
+            // 无法复现页面的图层筛选条件时，不冒险把分数关联到错误兽群。
+            warnGroupMappingFailure(error);
+            return null;
+        }
+    }
+
     let scoresVersion = 0;
 
     function captureScores(reserveData, saveName) {
         const reserveId = `r${saveName.match(/\d+/)?.[0] ?? ''}`;
         const table = new Map();
+        let reserveArea = null;
+        let spawnPointsByArea = {};
 
-        for (const population of reserveData.Populations ?? []) {
-            const name = resolveName(population, reserveId);
-            if (!name) continue;
+        try {
+            if (typeof areas === 'undefined' || !areas[reserveId]) {
+                throw new Error(`Reserve geometry is unavailable for ${reserveId}`);
+            }
+            reserveArea = JSON.parse(areas[reserveId]);
+            if (!reserveArea || typeof reserveArea !== 'object') {
+                throw new Error(`Invalid reserve geometry for ${reserveId}`);
+            }
+            if (typeof area_spawn_center_points !== 'undefined') {
+                spawnPointsByArea = area_spawn_center_points[reserveId] ?? {};
+            }
+        } catch (error) {
+            warnGroupMappingFailure(error);
+        }
 
-            const counters = new Map();
-            for (const group of Object.values(population.Groups ?? {})) {
-                const sa = String(group.SpawnAreadId);
-                const idx = counters.get(sa) ?? 0;
-                counters.set(sa, idx + 1);
+        if (reserveArea) {
+            for (const population of reserveData.Populations ?? []) {
+                const name = resolveName(population, reserveId);
+                if (!name) continue;
 
-                const scores = (group.Animals ?? [])
-                    .map((a) => a.Score)
-                    .filter((s) => typeof s === 'number')
-                    .sort((x, y) => y - x);
-                if (scores.length) table.set(keyOf(name, sa, idx), scores);
+                const pageIndexBySourceIndex = pageGroupIndices(population, reserveArea, spawnPointsByArea);
+                if (!pageIndexBySourceIndex) continue;
+
+                for (const [sourceIndex, group] of Object.entries(population.Groups ?? {})) {
+                    const pageIndex = pageIndexBySourceIndex.get(sourceIndex);
+                    if (pageIndex === undefined) continue;
+
+                    const spawnAreaId = String(group.SpawnAreadId);
+                    const scores = (group.Animals ?? [])
+                        .map((animal) => animal.Score)
+                        .filter((score) => typeof score === 'number')
+                        .sort((a, b) => b - a);
+                    if (scores.length) table.set(keyOf(name, spawnAreaId, pageIndex), scores);
+                }
             }
         }
 
-        if (table.size) {
-            scoresByReserve.set(reserveId, table);
-            scoresVersion += 1;
-            queueRebuild();
-        }
+        // 覆盖空表也能清除该保护区先前缓存，避免新存档沿用旧分数。
+        scoresByReserve.set(reserveId, table);
+        scoresVersion += 1;
+        queueRebuild();
     }
 
     function hookSaveParser() {
@@ -199,9 +261,18 @@
         .cotw-range { display: flex; gap: 8px; }
         .cotw-range > div { flex: 1; }
         #cotw-status { margin-top: 8px; font-size: 12px; color: #9fd3a4; min-height: 1.2em; word-break: break-all; }
+        #cotw-area-info { margin-top: 10px; padding-top: 8px; border-top: 1px solid #566; }
+        #cotw-area-title { color: #ddd; font-weight: 600; }
+        #cotw-area-results { max-height: 220px; overflow-y: auto; margin-top: 4px; user-select: text; }
+        .cotw-area-empty { color: #aaa; font-size: 12px; }
+        .cotw-area-group { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.12); }
+        .cotw-area-group:last-child { border-bottom: 0; }
+        .cotw-area-name { font-weight: 600; color: #eee; }
+        .cotw-area-meta { color: #bbb; font-size: 11px; }
+        .cotw-area-scores { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+        .cotw-area-score { padding: 1px 4px; border-radius: 3px; background: rgba(255,255,255,0.12); }
         #pop_nav ul.cotw-animals { padding-left: 20px; }
         #pop_nav ul.cotw-animals > li { font-size: 12px; color: #555; padding: 1px 0; }
-        #pop_nav ul.cotw-animals > li.cotw-hit { color: #0b7a34; font-weight: 600; }
         #pop_nav .cotw-caret { cursor: pointer; }
     `;
     document.head.appendChild(style);
@@ -220,6 +291,10 @@
             <button id="cotw-apply">筛选并勾选</button>
             <button id="cotw-clear" class="cotw-secondary">全部取消</button>
             <div id="cotw-status"></div>
+            <div id="cotw-area-info">
+                <div id="cotw-area-title">点击地图区域查看个体分数</div>
+                <div id="cotw-area-results"></div>
+            </div>
         </div>
     `;
     document.body.appendChild(panel);
@@ -232,6 +307,7 @@
     const btnApply = $('#cotw-apply', panel);
     const btnClear = $('#cotw-clear', panel);
     const status = $('#cotw-status', panel);
+    const areaResults = $('#cotw-area-results', panel);
 
     // —— 拖拽 / 折叠 ——
 
@@ -287,6 +363,132 @@
         return (min === null || score >= min) && (max === null || score <= max);
     }
 
+    // —— 地图点击区域的个体分数 ——
+
+    let selectedAreaEntries = [];
+    let areaEmptyText = '点击地图上的种群区域查看兽群个体分数';
+
+    function formatAreaTime(hours) {
+        const minutes = Math.trunc(hours * 60);
+        const normalized = ((minutes % 1440) + 1440) % 1440;
+        return `${String(Math.trunc(normalized / 60)).padStart(2, '0')}:${String(normalized % 60).padStart(2, '0')}`;
+    }
+
+    function areaTypeName(type) {
+        const names = {
+            feeding: '觅食区', drinking: '饮水区', resting: '休息区', spawn: '出生区',
+            feed: '觅食区', drink: '饮水区', rest: '休息区',
+        };
+        return names[type] ?? type ?? '种群区域';
+    }
+
+    function areaDescriptions(feature) {
+        const info = feature.properties.zone_info;
+        if (typeof info.zone_time_begin === 'number' && typeof info.zone_time_end === 'number') {
+            return [`${areaTypeName(feature.properties.zone_type)} [${formatAreaTime(info.zone_time_begin)}, ${formatAreaTime(info.zone_time_end)})`];
+        }
+        if (Array.isArray(info.need_schedule)) {
+            return info.need_schedule.map((schedule) => {
+                const [start, end, , type] = schedule;
+                return `${areaTypeName(type)} [${formatAreaTime(start)}, ${formatAreaTime(end)})`;
+            });
+        }
+        return [areaTypeName(feature.properties.zone_type)];
+    }
+
+    function groupsAtMapPoint(mapInstance, latlng) {
+        const pip = typeof leafletPip !== 'undefined' ? leafletPip : window.leafletPip;
+        if (!pip?.pointInLayer) throw new Error('leafletPip.pointInLayer is unavailable');
+
+        const hits = pip.pointInLayer(latlng, mapInstance);
+        const entries = new Map();
+        for (const hit of hits) {
+            const feature = hit.feature;
+            const properties = feature?.properties;
+            const info = properties?.zone_info;
+            if (!['need_zone', 'spawn_center_point'].includes(properties?.type) || !info) continue;
+            if (info.population_id == null || info.spawn_area_id == null || info.group_index == null) continue;
+
+            const key = [info.population_id, info.spawn_area_id, info.group_index].map(String).join('|');
+            let entry = entries.get(key);
+            if (!entry) {
+                entry = {
+                    populationId: String(info.population_id),
+                    populationName: info.population_name ?? '',
+                    spawnAreaId: String(info.spawn_area_id),
+                    groupIndex: String(info.group_index),
+                    maxScore: info.max_score,
+                    areas: new Set(),
+                };
+                entries.set(key, entry);
+            }
+            for (const description of areaDescriptions(feature)) entry.areas.add(description);
+        }
+        return [...entries.values()];
+    }
+
+    function findCachedGroup(entry) {
+        return groupCache.find((group) => group.cb.isConnected &&
+            String(group.cb.dataset.populationId) === entry.populationId &&
+            String(group.cb.dataset.spawnAreaId) === entry.spawnAreaId &&
+            String(group.cb.dataset.groupIndex) === entry.groupIndex);
+    }
+
+    function renderSelectedArea() {
+        areaResults.replaceChildren();
+        if (selectedAreaEntries.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'cotw-area-empty';
+            empty.textContent = areaEmptyText;
+            areaResults.appendChild(empty);
+            return;
+        }
+
+        for (const entry of selectedAreaEntries) {
+            const block = document.createElement('div');
+            block.className = 'cotw-area-group';
+
+            const group = findCachedGroup(entry);
+            const name = group?.name || entry.populationName || `物种 ${entry.populationId}`;
+            const heading = document.createElement('div');
+            heading.className = 'cotw-area-name';
+            heading.textContent = `${name} · 群 ${entry.groupIndex}`;
+            block.appendChild(heading);
+
+            const meta = document.createElement('div');
+            meta.className = 'cotw-area-meta';
+            const details = [`出生区 ${entry.spawnAreaId}`, ...entry.areas];
+            meta.textContent = details.join(' · ');
+            block.appendChild(meta);
+
+            if (group?.scores?.length) {
+                const scoreTitle = document.createElement('div');
+                scoreTitle.className = 'cotw-area-meta';
+                scoreTitle.textContent = `个体分数（${group.scores.length} 只）`;
+                block.appendChild(scoreTitle);
+
+                const scores = document.createElement('div');
+                scores.className = 'cotw-area-scores';
+                for (const score of group.scores) {
+                    const chip = document.createElement('span');
+                    chip.className = 'cotw-area-score';
+                    chip.textContent = score.toFixed(1);
+                    scores.appendChild(chip);
+                }
+                block.appendChild(scores);
+            } else {
+                const unavailable = document.createElement('div');
+                unavailable.className = 'cotw-area-meta';
+                unavailable.textContent = '个体分数不可用';
+                if (typeof entry.maxScore === 'number' && Number.isFinite(entry.maxScore)) {
+                    unavailable.textContent += ` · 地图最高分 ${entry.maxScore.toFixed(1)}`;
+                }
+                block.appendChild(unavailable);
+            }
+            areaResults.appendChild(block);
+        }
+    }
+
     // —— 个体层渲染 ——
 
     function decorateGroupRow(li, scores) {
@@ -311,12 +513,6 @@
         }
     }
 
-    function refreshHighlights() {
-        for (const row of $$('#pop_nav ul.cotw-animals > li')) {
-            row.classList.toggle('cotw-hit', inRange(parseFloat(row.dataset.score)));
-        }
-    }
-
     let rebuildToken = 0;
 
     async function rebuildIndex() {
@@ -337,7 +533,6 @@
 
         if (token !== rebuildToken) return; // 已有更新的重建，丢弃本次结果
         groupCache = cache;
-        refreshHighlights();
     }
 
     // —— 物种下拉框 ——
@@ -375,24 +570,32 @@
         const groups = groupCache.filter((g) => g.name === selSpecies.value);
         let passing = 0;
         let hits = 0;
+        let preciseGroups = 0;
+        let fallbackGroups = 0;
 
-        for (const g of groups) {
-            if (g.scores) {
-                const matched = g.scores.filter(inRange).length;
+        for (const group of groups) {
+            if (group.scores?.length) {
+                preciseGroups += 1;
+                const matched = group.scores.filter(inRange).length;
                 if (matched > 0) { passing += 1; hits += matched; }
-            } else if (inRange(parseScore(g.cb))) {
-                passing += 1;
+            } else {
+                fallbackGroups += 1;
+                if (inRange(parseScore(group.cb))) passing += 1;
             }
         }
-        return { total: groups.length, passing, hits, precise: groups.some((g) => g.scores) };
+        return { total: groups.length, passing, hits, preciseGroups, fallbackGroups };
+    }
+
+    function summaryText({ total, passing, hits, preciseGroups, fallbackGroups }) {
+        const prefix = `${total} 群 · 达标 ${passing} 群`;
+        if (fallbackGroups === 0) return `${prefix} · 命中 ${hits} 只`;
+        if (preciseGroups === 0) return `${prefix} · 按最高分`;
+        return `${prefix} · 个体分数 ${preciseGroups} 群 · 最高分回退 ${fallbackGroups} 群 · 精确命中 ${hits} 只`;
     }
 
     function updatePreview() {
         if (!selSpecies.value) { status.textContent = ''; return; }
-        const { total, passing, hits, precise } = summarize();
-        status.textContent = precise
-            ? `${total} 群 · 达标 ${passing} · 命中 ${hits} 只`
-            : `${total} 群 · 达标 ${passing} · 按最高分`;
+        status.textContent = summaryText(summarize());
     }
 
     // —— 主操作 ——
@@ -405,10 +608,10 @@
         }
 
         btnApply.disabled = true;
-        const { passing, hits, precise } = summarize();
+        const summary = summarize();
 
         await runBatches(groups, (g, i) => {
-            const want = g.scores
+            const want = g.scores?.length
                 ? g.scores.some(inRange)
                 : inRange(parseScore(g.cb));
             setChecked(g.cb, want);
@@ -424,11 +627,8 @@
             $$('ul.nested', popRow).forEach((u) => u.classList.add('active'));
         }
 
-        refreshHighlights();
         btnApply.disabled = false;
-        status.textContent = precise
-            ? `达标 ${passing}/${groups.length} 群 · 命中 ${hits} 只`
-            : `达标 ${passing}/${groups.length} 群 · 按最高分`;
+        status.textContent = summaryText(summary);
     }
 
     function clearAll() {
@@ -463,6 +663,49 @@
         await rebuildIndex();
         refreshSpecies();
         updatePreview();
+        renderSelectedArea();
+    }
+
+    const attachedMaps = new WeakSet();
+
+    function resolvePageMap() {
+        try {
+            return typeof map !== 'undefined' ? map : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function attachMapClickListener() {
+        const pageMap = resolvePageMap();
+        if (!pageMap || typeof pageMap.on !== 'function' || attachedMaps.has(pageMap)) return;
+        attachedMaps.add(pageMap);
+
+        selectedAreaEntries = [];
+        areaEmptyText = '点击地图上的种群区域查看兽群个体分数';
+        renderSelectedArea();
+
+        // 独立监听页面地图事件；不覆盖原有点击处理器或 map_info 内容。
+        pageMap.on('click', (event) => {
+            try {
+                selectedAreaEntries = groupsAtMapPoint(pageMap, event.latlng);
+                areaEmptyText = selectedAreaEntries.length
+                    ? ''
+                    : '本次点击未命中可显示的种群区域';
+            } catch (error) {
+                selectedAreaEntries = [];
+                areaEmptyText = '区域信息读取失败；原地图信息栏仍可用';
+                console.error('[COTW 种群分数筛选] 读取地图区域失败', error);
+            }
+            renderSelectedArea();
+        });
+    }
+
+    const mapContainer = $('#map_display');
+    attachMapClickListener();
+    if (mapContainer) {
+        // 切换保护区时页面会重建 Leaflet map；等新地图 DOM 就绪后绑定一次。
+        new MutationObserver(attachMapClickListener).observe(mapContainer, { childList: true });
     }
 
     const dropzone = $('#dropzone');
