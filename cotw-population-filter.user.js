@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      1.3.0
-// @description  按物种和分数区间筛选动物兽群，支持个体分数与存档自动监听
+// @version      1.4.1
+// @description  按物种和分数区间筛选动物兽群，支持个体分数与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
 // @run-at       document-idle
@@ -21,12 +21,13 @@
   async function runBatches(items, worker, budgetMs = 8) {
     let t0 = performance.now();
     for (let i = 0; i < items.length; ++i) {
-      worker(items[i], i);
+      if (worker(items[i], i) === false) return false;
       if (performance.now() - t0 > budgetMs) {
         await yieldToUI();
         t0 = performance.now();
       }
     }
+    return true;
   }
 
   // —— 种群树解析 ——
@@ -70,8 +71,9 @@
   // group_index 按页面实际生成的地图组编号计算，跳过不会生成图层的原始群。
 
   const scoresByReserve = new Map(); // reserveId -> Map<key, number[]>
-  const keyOf = (name, spawnAreaId, groupIndex) =>
-    `${name}|${spawnAreaId}|${groupIndex}`;
+  const keyOf = (...parts) => JSON.stringify(parts.map(String));
+  const mapGroupKey = (populationId, spawnAreaId, groupIndex) =>
+    keyOf(populationId, spawnAreaId, groupIndex);
 
   // 页面内部全局是 let 声明，标识符未就绪时抛 ReferenceError，统一兜底
   function resolveName(population, reserveId) {
@@ -169,7 +171,11 @@
     }
 
     if (reserveArea) {
-      for (const population of reserveData.Populations ?? []) {
+      const populations = Array.isArray(reserveData?.Populations)
+        ? reserveData.Populations
+        : [];
+      for (const population of populations) {
+        if (!population || typeof population !== "object") continue;
         const name = resolveName(population, reserveId);
         if (!name) continue;
 
@@ -188,8 +194,8 @@
 
           const spawnAreaId = String(group.SpawnAreadId);
           const scores = (group.Animals ?? [])
-            .map((animal) => animal.Score)
-            .filter((score) => typeof score === "number")
+            .map((animal) => animal?.Score)
+            .filter(Number.isFinite)
             .sort((a, b) => b - a);
           if (scores.length)
             table.set(keyOf(name, spawnAreaId, pageIndex), scores);
@@ -281,6 +287,8 @@
         #cotw-filter-body button:hover { filter: brightness(1.12); }
         #cotw-filter-body button:disabled { opacity: 0.5; cursor: default; }
         #cotw-filter-body button.cotw-secondary { background: #555f66; }
+        #cotw-selected-save-actions:not([hidden]) { display: flex; gap: 8px; }
+        #cotw-selected-save-actions button { flex: 1; width: auto; min-width: 0; }
         .cotw-range { display: flex; gap: 8px; }
         .cotw-range > div { flex: 1; }
         #cotw-status { margin-top: 8px; font-size: 12px; color: #9fd3a4; min-height: 1.2em; word-break: break-all; }
@@ -312,7 +320,11 @@
             </div>
             <button id="cotw-apply">筛选并勾选</button>
             <button id="cotw-clear" class="cotw-secondary">全部取消</button>
-            <button id="cotw-watch-save" class="cotw-secondary">监听存档</button>
+            <button id="cotw-select-save" class="cotw-secondary">选择存档文件</button>
+            <div id="cotw-selected-save-actions" hidden>
+                <button id="cotw-reselect-save" class="cotw-secondary">重新选择存档</button>
+                <button id="cotw-refresh-save">刷新存档</button>
+            </div>
             <div id="cotw-status"></div>
             <div id="cotw-area-info" hidden>
                 <div id="cotw-area-results"></div>
@@ -328,7 +340,10 @@
   const inpMax = $("#cotw-max", panel);
   const btnApply = $("#cotw-apply", panel);
   const btnClear = $("#cotw-clear", panel);
-  const btnWatchSave = $("#cotw-watch-save", panel);
+  const btnSelectSave = $("#cotw-select-save", panel);
+  const selectedSaveActions = $("#cotw-selected-save-actions", panel);
+  const btnReselectSave = $("#cotw-reselect-save", panel);
+  const btnRefreshSave = $("#cotw-refresh-save", panel);
   const status = $("#cotw-status", panel);
   const areaInfo = $("#cotw-area-info", panel);
   const areaResults = $("#cotw-area-results", panel);
@@ -389,11 +404,13 @@
     return v === "" ? null : parseFloat(v);
   };
 
-  function inRange(score) {
-    if (isNaN(score)) return false;
+  function makeRangeMatcher() {
     const min = boundValue(inpMin);
     const max = boundValue(inpMax);
-    return (min === null || score >= min) && (max === null || score <= max);
+    return (score) =>
+      Number.isFinite(score) &&
+      (min === null || score >= min) &&
+      (max === null || score <= max);
   }
 
   // —— 地图点击区域的个体分数 ——
@@ -463,9 +480,11 @@
       )
         continue;
 
-      const key = [info.population_id, info.spawn_area_id, info.group_index]
-        .map(String)
-        .join("|");
+      const key = mapGroupKey(
+        info.population_id,
+        info.spawn_area_id,
+        info.group_index,
+      );
       let entry = entries.get(key);
       if (!entry) {
         entry = {
@@ -484,14 +503,13 @@
     return [...entries.values()];
   }
 
+  let groupCacheByMapKey = new Map();
+
   function findCachedGroup(entry) {
-    return groupCache.find(
-      (group) =>
-        group.cb.isConnected &&
-        String(group.cb.dataset.populationId) === entry.populationId &&
-        String(group.cb.dataset.spawnAreaId) === entry.spawnAreaId &&
-        String(group.cb.dataset.groupIndex) === entry.groupIndex,
+    const group = groupCacheByMapKey.get(
+      mapGroupKey(entry.populationId, entry.spawnAreaId, entry.groupIndex),
     );
+    return group?.cb.isConnected ? group : null;
   }
 
   function renderSelectedArea() {
@@ -558,53 +576,77 @@
 
   // —— 个体层渲染 ——
 
-  function decorateGroupRow(li, scores) {
-    const ul = document.createElement("ul");
-    ul.className = "nested cotw-animals";
-    ul.append(
-      ...scores.map((s) => {
+  function syncGroupScoreRows(li, scores) {
+    let list = $(":scope > ul.cotw-animals", li);
+    const caret = $(":scope > .nav-spacer, :scope > .cotw-caret", li);
+
+    if (!scores?.length) {
+      list?.remove();
+      if (caret) caret.className = "nav-spacer";
+      return;
+    }
+
+    if (!list) {
+      list = document.createElement("ul");
+      list.className = "nested cotw-animals";
+      li.append(list);
+    }
+    list.replaceChildren(
+      ...scores.map((score) => {
         const row = document.createElement("li");
-        row.textContent = s.toFixed(1);
-        row.dataset.score = s;
+        row.textContent = score.toFixed(1);
+        row.dataset.score = score;
         return row;
       }),
     );
-    li.append(ul);
 
-    // 行首占位符换成展开箭头，复用页面的 caret 样式
-    const spacer = $(":scope > .nav-spacer", li);
-    if (spacer) {
-      spacer.className = "nav-caret cotw-caret";
-      spacer.addEventListener("click", () => {
-        ul.classList.toggle("active");
-        spacer.classList.toggle("nav-caret-down");
+    if (!caret) return;
+    caret.classList.remove("nav-spacer");
+    caret.classList.add("nav-caret", "cotw-caret");
+    caret.classList.toggle("nav-caret-down", list.classList.contains("active"));
+    if (!caret.dataset.cotwScoresToggleBound) {
+      caret.dataset.cotwScoresToggleBound = "true";
+      caret.addEventListener("click", () => {
+        const currentList = $(":scope > ul.cotw-animals", li);
+        if (!currentList) return;
+        const expanded = currentList.classList.toggle("active");
+        caret.classList.toggle("nav-caret-down", expanded);
       });
     }
   }
 
   let rebuildToken = 0;
 
-  async function rebuildIndex() {
+  async function rebuildIndex(inputs) {
     const token = ++rebuildToken;
+    const version = scoresVersion;
     popNameCache.clear();
     const cache = [];
+    const cacheByMapKey = new Map();
 
-    await runBatches(
-      $$("#pop_nav input.nav-visible[data-group-index]"),
-      (cb) => {
-        const li = cb.closest("li");
-        const name = nameOfGroup(cb);
-        const scores = name ? lookupScores(name, cb.dataset) : null;
+    const completed = await runBatches(inputs, (cb) => {
+      if (token !== rebuildToken || version !== scoresVersion) return false;
+      const li = cb.closest("li");
+      const name = nameOfGroup(cb);
+      const scores = name ? lookupScores(name, cb.dataset) : null;
 
-        if (li && scores?.length && !$(":scope > ul.cotw-animals", li)) {
-          decorateGroupRow(li, scores);
-        }
-        cache.push({ cb, name, scores: scores ?? null });
-      },
-    );
+      if (li) syncGroupScoreRows(li, scores);
+      const group = { cb, name, scores: scores ?? null };
+      cache.push(group);
+      const { populationId, spawnAreaId, groupIndex } = cb.dataset;
+      if (populationId && spawnAreaId && groupIndex) {
+        cacheByMapKey.set(
+          mapGroupKey(populationId, spawnAreaId, groupIndex),
+          group,
+        );
+      }
+    });
 
-    if (token !== rebuildToken) return; // 已有更新的重建，丢弃本次结果
+    if (!completed || token !== rebuildToken || version !== scoresVersion)
+      return false;
     groupCache = cache;
+    groupCacheByMapKey = cacheByMapKey;
+    return true;
   }
 
   // —— 物种下拉框 ——
@@ -621,12 +663,11 @@
       opt.value = "";
       opt.textContent = "暂无数据";
       selSpecies.appendChild(opt);
-      btnApply.disabled = true;
+      updateActionControls();
       status.textContent = "";
       return;
     }
 
-    btnApply.disabled = false;
     for (const name of names) {
       const opt = document.createElement("option");
       opt.value = name;
@@ -634,13 +675,16 @@
       selSpecies.appendChild(opt);
     }
     if (names.includes(prev)) selSpecies.value = prev;
+    updateActionControls();
     updatePreview();
   }
 
   // —— 统计 ——
 
-  function summarize() {
-    const groups = groupCache.filter((g) => g.name === selSpecies.value);
+  function summarize(
+    groups = groupCache.filter((g) => g.name === selSpecies.value),
+    matchesScore = makeRangeMatcher(),
+  ) {
     let passing = 0;
     let hits = 0;
     let preciseGroups = 0;
@@ -649,14 +693,14 @@
     for (const group of groups) {
       if (group.scores?.length) {
         preciseGroups += 1;
-        const matched = group.scores.filter(inRange).length;
+        const matched = group.scores.filter(matchesScore).length;
         if (matched > 0) {
           passing += 1;
           hits += matched;
         }
       } else {
         fallbackGroups += 1;
-        if (inRange(parseScore(group.cb))) passing += 1;
+        if (matchesScore(parseScore(group.cb))) passing += 1;
       }
     }
     return {
@@ -692,62 +736,75 @@
   // —— 主操作 ——
 
   async function applyFilter() {
-    const groups = groupCache.filter((g) => g.name === selSpecies.value);
+    if (operationInFlight) return;
+    const sourceCache = groupCache;
+    const species = selSpecies.value;
+    const groups = sourceCache.filter((group) => group.name === species);
     if (!groups.length) {
       status.textContent = "无可用数据";
       return;
     }
 
-    btnApply.disabled = true;
-    const summary = summarize();
+    const matchesScore = makeRangeMatcher();
+    const summary = summarize(groups, matchesScore);
+    operationInFlight = true;
+    updateActionControls();
 
-    await runBatches(groups, (g, i) => {
-      const want = g.scores?.length
-        ? g.scores.some(inRange)
-        : inRange(parseScore(g.cb));
-      setChecked(g.cb, want);
-      if (i % 16 === 0) status.textContent = `筛选中 ${i}/${groups.length}`;
-    });
+    try {
+      const completed = await runBatches(groups, (group, index) => {
+        if (groupCache !== sourceCache || !group.cb.isConnected) return false;
+        const want = group.scores?.length
+          ? group.scores.some(matchesScore)
+          : matchesScore(parseScore(group.cb));
+        setChecked(group.cb, want);
+        if (index % 16 === 0)
+          status.textContent = `筛选中 ${index}/${groups.length}`;
+      });
+      if (!completed) {
+        status.textContent = "种群列表已更新，请重新筛选";
+        return;
+      }
 
-    // 展开该物种分支，方便查看勾选结果
-    const popRow = populationRows()
-      .find((cb) => populationName(cb) === selSpecies.value)
-      ?.closest("li");
-    if (popRow) {
-      $$(".nav-caret", popRow).forEach((c) =>
-        c.classList.add("nav-caret-down"),
-      );
-      $$("ul.nested", popRow).forEach((u) => u.classList.add("active"));
+      // 展开该物种分支，方便查看勾选结果
+      const popRow = populationRows()
+        .find((cb) => populationName(cb) === species)
+        ?.closest("li");
+      if (popRow) {
+        $$(".nav-caret", popRow).forEach((caret) =>
+          caret.classList.add("nav-caret-down"),
+        );
+        $$("ul.nested", popRow).forEach((list) => list.classList.add("active"));
+      }
+
+      status.textContent = summaryText(summary);
+    } catch (error) {
+      status.textContent = "筛选失败";
+      console.error("[COTW 种群分数筛选] 应用筛选失败", error);
+    } finally {
+      operationInFlight = false;
+      updateActionControls();
     }
-
-    btnApply.disabled = false;
-    status.textContent = summaryText(summary);
   }
 
   function clearAll() {
+    if (operationInFlight) return;
     $$("#pop_nav input.nav-visible").forEach((cb) => setChecked(cb, false));
     status.textContent = "已清空";
   }
 
-  // —— 单个存档文件自动监听 ——
+  // —— 单个存档文件选择与手动刷新 ——
 
   const SAVE_HANDLE_DB = "cotw-population-filter";
   const SAVE_HANDLE_STORE = "settings";
-  const SAVE_HANDLE_KEY = "watched-population-file";
+  const SAVE_HANDLE_KEY = "selected-population-file";
   const SAVE_FILE_PATTERN = /^animal_population_\d+$/;
   const SAVE_MAGIC = [0x53, 0x41, 0x56, 0x45]; // SAVE
   const ADF_ENVELOPE = [0x01, 0x01, 0x00, 0x00, 0x00, 0x20, 0x46, 0x44, 0x41];
   const ADF_MAGIC = [0x20, 0x46, 0x44, 0x41]; // " FDA"
 
-  let watchedSaveHandle = null;
-  let watchTimer = null;
-  let watchActive = false;
-  let watchPermissionPending = false;
-  let watchPollInFlight = false;
-  let watchLastSignature = null;
-  let watchCandidateSignature = null;
-  let watchCandidateSince = 0;
-  let watchLastError = null;
+  let selectedSaveHandle = null;
+  let operationInFlight = false;
+  let saveSelectionVersion = 0;
 
   function openSaveHandleDatabase() {
     return new Promise((resolve, reject) => {
@@ -760,80 +817,63 @@
     });
   }
 
-  async function readSavedHandle() {
+  async function transactSaveHandle(mode, operation) {
     const db = await openSaveHandleDatabase();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(SAVE_HANDLE_STORE, "readonly");
-      const request = transaction
-        .objectStore(SAVE_HANDLE_STORE)
-        .get(SAVE_HANDLE_KEY);
-      let handle = null;
-      request.onsuccess = () => {
-        handle = request.result ?? null;
-      };
-      transaction.oncomplete = () => {
+      let settled = false;
+      let request;
+      let transaction;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
         db.close();
-        resolve(handle);
+        callback(value);
       };
-      transaction.onerror = () => {
-        db.close();
-        reject(transaction.error);
-      };
-      transaction.onabort = () => {
-        db.close();
-        reject(transaction.error);
-      };
+
+      try {
+        transaction = db.transaction(SAVE_HANDLE_STORE, mode);
+        request = operation(transaction.objectStore(SAVE_HANDLE_STORE));
+        transaction.oncomplete = () => finish(resolve, request?.result);
+        transaction.onerror = () =>
+          finish(reject, transaction.error ?? request?.error);
+        transaction.onabort = () =>
+          finish(reject, transaction.error ?? request?.error);
+      } catch (error) {
+        finish(reject, error);
+      }
     });
+  }
+
+  async function readSavedHandle() {
+    return (
+      (await transactSaveHandle("readonly", (store) =>
+        store.get(SAVE_HANDLE_KEY),
+      )) ?? null
+    );
   }
 
   async function writeSavedHandle(handle) {
-    const db = await openSaveHandleDatabase();
-    return new Promise((resolve, reject) => {
-      const transaction = db.transaction(SAVE_HANDLE_STORE, "readwrite");
-      transaction.objectStore(SAVE_HANDLE_STORE).put(handle, SAVE_HANDLE_KEY);
-      transaction.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      transaction.onerror = () => {
-        db.close();
-        reject(transaction.error);
-      };
-      transaction.onabort = () => {
-        db.close();
-        reject(transaction.error);
-      };
-    });
+    await transactSaveHandle("readwrite", (store) =>
+      store.put(handle, SAVE_HANDLE_KEY),
+    );
   }
 
-  async function deleteSavedHandle() {
-    const db = await openSaveHandleDatabase();
-    return new Promise((resolve, reject) => {
-      const transaction = db.transaction(SAVE_HANDLE_STORE, "readwrite");
-      transaction.objectStore(SAVE_HANDLE_STORE).delete(SAVE_HANDLE_KEY);
-      transaction.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      transaction.onerror = () => {
-        db.close();
-        reject(transaction.error);
-      };
-      transaction.onabort = () => {
-        db.close();
-        reject(transaction.error);
-      };
-    });
+  function updateSelectedSaveControls() {
+    const hasSelection = Boolean(selectedSaveHandle);
+    btnSelectSave.hidden = hasSelection;
+    selectedSaveActions.hidden = !hasSelection;
+    updateActionControls();
   }
 
-  function updateWatchButton() {
-    if (watchActive && watchedSaveHandle) {
-      btnWatchSave.textContent = "停止监听";
-    } else if (watchPermissionPending && watchedSaveHandle) {
-      btnWatchSave.textContent = "恢复监听";
-    } else {
-      btnWatchSave.textContent = "监听存档";
-    }
+  function updateActionControls() {
+    btnApply.disabled = operationInFlight || !selSpecies.value;
+    btnClear.disabled = operationInFlight;
+    btnSelectSave.disabled = operationInFlight;
+    btnReselectSave.disabled = operationInFlight || !selectedSaveHandle;
+    btnRefreshSave.disabled = operationInFlight || !selectedSaveHandle;
+    selSpecies.disabled = operationInFlight;
+    inpMin.disabled = operationInFlight;
+    inpMax.disabled = operationInFlight;
   }
 
   function pageSaveMapping() {
@@ -906,215 +946,110 @@
     return `${file.lastModified}:${file.size}`;
   }
 
-  function stopSaveWatchTimer() {
-    watchActive = false;
-    clearInterval(watchTimer);
-    watchTimer = null;
-    watchCandidateSignature = null;
-    updateWatchButton();
-  }
-
-  function startSaveWatch(handle) {
-    clearInterval(watchTimer);
-    watchedSaveHandle = handle;
-    watchActive = true;
-    watchPermissionPending = false;
-    watchLastSignature = null;
-    watchCandidateSignature = null;
-    watchLastError = null;
-    updateWatchButton();
-    void pollWatchedSave(true);
-    watchTimer = setInterval(() => void pollWatchedSave(false), 2500);
-  }
-
-  async function pollWatchedSave(force) {
+  function validateSaveHandle(handle) {
+    if (!SAVE_FILE_PATTERN.test(handle.name)) {
+      throw new Error("请选择 animal_population_* 文件");
+    }
+    const mapping = pageSaveMapping();
     if (
-      !watchActive ||
-      !watchedSaveHandle ||
-      watchPollInFlight ||
-      document.hidden
-    )
-      return;
-    watchPollInFlight = true;
-    const handle = watchedSaveHandle;
-
-    try {
-      const permission = await handle.queryPermission({ mode: "read" });
-      if (permission !== "granted") {
-        stopSaveWatchTimer();
-        watchPermissionPending = true;
-        updateWatchButton();
-        status.textContent = "需要重新授权";
-        return;
-      }
-
-      const file = await handle.getFile();
-      const signature = saveFileSignature(file);
-      if (signature === watchLastSignature) {
-        watchCandidateSignature = null;
-        return;
-      }
-
-      if (!force) {
-        if (signature !== watchCandidateSignature) {
-          watchCandidateSignature = signature;
-          watchCandidateSince = Date.now();
-          return;
-        }
-        if (Date.now() - watchCandidateSince < 2000) return;
-      }
-
-      if (!isPageReadyForSave(file.name)) {
-        status.textContent = "等待 DECA 地图数据就绪…";
-        return;
-      }
-
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const latestFile = await handle.getFile();
-      if (saveFileSignature(latestFile) !== signature) {
-        watchCandidateSignature = null;
-        return;
-      }
-      if (!watchActive || watchedSaveHandle !== handle) return;
-
-      parseAndApplySave(file.name, bytes);
-      watchLastSignature = signature;
-      watchCandidateSignature = null;
-      watchLastError = null;
-      status.textContent = `已同步：${file.name}`;
-    } catch (error) {
-      const errorKey = `${watchedSaveHandle?.name}:${error?.name}:${error?.message}`;
-      if (errorKey !== watchLastError) {
-        console.error(
-          "[COTW 种群分数筛选] 自动读取存档失败，将继续重试",
-          error,
-        );
-        watchLastError = errorKey;
-      }
-      status.textContent = "读取失败，将重试";
-    } finally {
-      watchPollInFlight = false;
+      !mapping ||
+      !Object.prototype.hasOwnProperty.call(mapping, handle.name)
+    ) {
+      throw new Error("存档文件不匹配");
     }
   }
 
-  async function handleWatchSaveClick() {
+  async function chooseSaveFile() {
+    if (operationInFlight) return;
     if (
       !window.isSecureContext ||
       typeof window.showOpenFilePicker !== "function"
     ) {
-      status.textContent = "浏览器不支持文件监听";
-      return;
-    }
-
-    if (watchActive) {
-      stopSaveWatchTimer();
-      watchedSaveHandle = null;
-      watchPermissionPending = false;
-      watchLastSignature = null;
-      try {
-        await deleteSavedHandle();
-      } catch (error) {
-        console.warn("[COTW 种群分数筛选] 无法清除已保存的存档文件句柄", error);
-      }
-      status.textContent = "已停止存档监听";
-      updateWatchButton();
-      return;
-    }
-
-    if (watchPermissionPending && watchedSaveHandle) {
-      try {
-        const permission = await watchedSaveHandle.requestPermission({
-          mode: "read",
-        });
-        if (permission === "granted") {
-          startSaveWatch(watchedSaveHandle);
-        } else {
-          watchedSaveHandle = null;
-          watchPermissionPending = false;
-          await deleteSavedHandle();
-          updateWatchButton();
-          status.textContent = "权限未授予，请重新选择文件";
-        }
-      } catch (error) {
-        updateWatchButton();
-        status.textContent = "恢复权限失败";
-        console.warn("[COTW 种群分数筛选] 恢复存档权限失败", error);
-      }
+      status.textContent = "浏览器不支持文件选择";
       return;
     }
 
     try {
       const [handle] = await window.showOpenFilePicker({ multiple: false });
       if (!handle) return;
-      if (!SAVE_FILE_PATTERN.test(handle.name)) {
-        status.textContent = "请选择 animal_population_* 文件";
-        return;
-      }
-      const mapping = pageSaveMapping();
-      if (
-        !mapping ||
-        !Object.prototype.hasOwnProperty.call(mapping, handle.name)
-      ) {
-        status.textContent = "存档文件不匹配";
-        return;
-      }
-
-      watchedSaveHandle = handle;
+      validateSaveHandle(handle);
+      selectedSaveHandle = handle;
+      saveSelectionVersion += 1;
+      updateSelectedSaveControls();
+      status.textContent = `已选择：${handle.name}`;
       try {
         await writeSavedHandle(handle);
       } catch (error) {
-        console.warn(
-          "[COTW 种群分数筛选] 无法记住存档文件句柄，本次页面仍会监听",
-          error,
-        );
-        status.textContent = "已开始监听；刷新后需重新选择";
+        console.warn("[COTW 种群分数筛选] 无法保存文件选择", error);
       }
-      startSaveWatch(handle);
     } catch (error) {
       if (error?.name !== "AbortError") {
-        status.textContent = "选择失败";
+        status.textContent =
+          error instanceof Error ? error.message : "选择失败";
         console.error("[COTW 种群分数筛选] 选择存档文件失败", error);
       }
     }
   }
 
-  async function restoreSaveWatch() {
-    if (
-      !window.isSecureContext ||
-      typeof window.showOpenFilePicker !== "function"
-    ) {
-      btnWatchSave.disabled = true;
-      btnWatchSave.textContent = "不支持监听";
-      return;
-    }
-    if (!window.indexedDB) {
+  async function refreshSelectedSave() {
+    const handle = selectedSaveHandle;
+    if (!handle || operationInFlight) return;
+    if (!isPageReadyForSave(handle.name)) {
+      status.textContent = "地图数据尚未就绪";
       return;
     }
 
+    operationInFlight = true;
+    updateActionControls();
     try {
-      const handle = await readSavedHandle();
-      if (!handle || !SAVE_FILE_PATTERN.test(handle.name)) return;
-      watchedSaveHandle = handle;
-      const permission = await handle.queryPermission({ mode: "read" });
-      if (permission === "granted") {
-        startSaveWatch(handle);
-      } else if (permission === "prompt") {
-        watchPermissionPending = true;
-        updateWatchButton();
-      } else {
-        watchedSaveHandle = null;
-        await deleteSavedHandle();
-        updateWatchButton();
+      const permission = await handle.requestPermission({ mode: "read" });
+      if (permission !== "granted") {
+        status.textContent = "未获得读取权限";
+        return;
       }
+
+      const file = await handle.getFile();
+      const signature = saveFileSignature(file);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const latestFile = await handle.getFile();
+      if (saveFileSignature(latestFile) !== signature) {
+        status.textContent = "存档仍在写入，请稍后刷新";
+        return;
+      }
+
+      parseAndApplySave(file.name, bytes);
+      status.textContent = `已刷新：${file.name}`;
     } catch (error) {
-      console.warn("[COTW 种群分数筛选] 无法恢复上次监听的存档文件", error);
+      status.textContent = "刷新失败";
+      console.error("[COTW 种群分数筛选] 手动刷新存档失败", error);
+    } finally {
+      operationInFlight = false;
+      updateActionControls();
     }
   }
 
-  btnWatchSave.addEventListener("click", () => void handleWatchSaveClick());
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && watchActive) void pollWatchedSave(false);
-  });
+  async function restoreSelectedSave() {
+    if (!window.indexedDB) return;
+    try {
+      const version = saveSelectionVersion;
+      const handle = await readSavedHandle();
+      if (
+        version !== saveSelectionVersion ||
+        !handle ||
+        !SAVE_FILE_PATTERN.test(handle.name)
+      )
+        return;
+      selectedSaveHandle = handle;
+      updateSelectedSaveControls();
+      status.textContent = `已选择：${handle.name}`;
+    } catch (error) {
+      console.warn("[COTW 种群分数筛选] 无法恢复存档选择", error);
+    }
+  }
+
+  btnSelectSave.addEventListener("click", () => void chooseSaveFile());
+  btnReselectSave.addEventListener("click", () => void chooseSaveFile());
+  btnRefreshSave.addEventListener("click", () => void refreshSelectedSave());
 
   btnApply.addEventListener("click", () => void applyFilter());
   btnClear.addEventListener("click", clearAll);
@@ -1122,7 +1057,7 @@
   inpMin.addEventListener("input", updatePreview);
   inpMax.addEventListener("input", updatePreview);
 
-  // —— 树重建（拖入存档 / 切换地图）后自动刷新 ——
+  // —— 树重建（拖入存档 / 切换地图）后重建索引 ——
 
   let rebuildTimer = null;
   function queueRebuild() {
@@ -1130,25 +1065,55 @@
     rebuildTimer = setTimeout(() => void onTreeChanged(), 150);
   }
 
-  // 记录已处理的树，自身 DOM 写入触发的变更不重复重建
+  // 输入节点和标签未变时，跳过由自身分数列表 DOM 更新触发的重建。
   let processedTree = null;
   let processedVersion = -1;
+  let processedInputs = [];
+  let processedSignatures = [];
+
+  function groupInputSignature(cb) {
+    const { populationId, spawnAreaId, groupIndex } = cb.dataset;
+    return JSON.stringify([
+      populationId ?? "",
+      spawnAreaId ?? "",
+      groupIndex ?? "",
+      rowText(cb),
+    ]);
+  }
 
   async function onTreeChanged() {
-    const root = $("#pop_nav");
-    if (
-      root === processedTree &&
-      scoresVersion === processedVersion &&
-      groupCache.length
-    )
-      return;
-    processedTree = root;
-    processedVersion = scoresVersion;
+    try {
+      const root = $("#pop_nav");
+      const inputs = $$("#pop_nav input.nav-visible[data-group-index]");
+      const signatures = inputs.map(groupInputSignature);
+      const unchanged =
+        root === processedTree &&
+        scoresVersion === processedVersion &&
+        inputs.length === processedInputs.length &&
+        inputs.every(
+          (input, index) =>
+            input === processedInputs[index] &&
+            signatures[index] === processedSignatures[index],
+        );
+      if (unchanged) return;
 
-    await rebuildIndex();
-    refreshSpecies();
-    updatePreview();
-    renderSelectedArea();
+      processedTree = root;
+      processedVersion = scoresVersion;
+      processedInputs = inputs;
+      processedSignatures = signatures;
+
+      if (!(await rebuildIndex(inputs))) return;
+      refreshSpecies();
+      updatePreview();
+      renderSelectedArea();
+    } catch (error) {
+      processedTree = null;
+      processedVersion = -1;
+      processedInputs = [];
+      processedSignatures = [];
+      status.textContent = "种群索引更新失败";
+      console.error("[COTW 种群分数筛选] 更新种群索引失败", error);
+    }
   }
 
   const attachedMaps = new WeakSet();
@@ -1210,5 +1175,5 @@
 
   hookSaveParser();
   void onTreeChanged();
-  void restoreSaveWatch();
+  void restoreSelectedSave();
 })();
