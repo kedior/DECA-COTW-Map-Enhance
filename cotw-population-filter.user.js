@@ -312,6 +312,11 @@
   panel.innerHTML = `
         <div id="cotw-filter-header"><span>🦌 种群分数筛选</span><span id="cotw-filter-toggle">−</span></div>
         <div id="cotw-filter-body">
+            <button id="cotw-select-save" class="cotw-secondary">选择存档文件</button>
+            <div id="cotw-selected-save-actions" hidden>
+                <button id="cotw-reselect-save" class="cotw-secondary">重新选择存档</button>
+                <button id="cotw-refresh-save">刷新存档</button>
+            </div>
             <label>物种</label>
             <select id="cotw-species"></select>
             <div class="cotw-range">
@@ -320,11 +325,6 @@
             </div>
             <button id="cotw-apply">筛选并勾选</button>
             <button id="cotw-clear" class="cotw-secondary">全部取消</button>
-            <button id="cotw-select-save" class="cotw-secondary">选择存档文件</button>
-            <div id="cotw-selected-save-actions" hidden>
-                <button id="cotw-reselect-save" class="cotw-secondary">重新选择存档</button>
-                <button id="cotw-refresh-save">刷新存档</button>
-            </div>
             <div id="cotw-status"></div>
             <div id="cotw-area-info" hidden>
                 <div id="cotw-area-results"></div>
