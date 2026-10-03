@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      1.4.1
-// @description  按物种和分数区间筛选动物兽群，支持个体分数与手动刷新存档
+// @version      1.5.0
+// @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
 // @run-at       document-idle
@@ -66,11 +66,15 @@
     if (cb.checked !== want) cb.click();
   };
 
-  // —— 个体分数捕获 ——
-  // 页面解析存档时个体 Score 算完 max 即被丢弃，这里挂钩子留存。
+  // —— 个体数据捕获 ——
+  // 页面解析存档时个体数据算完 max 就被丢弃，这里挂钩子留存。
+  // 每个个体记下 score / weight / gender（gender：1=公，2=母）。
   // group_index 按页面实际生成的地图组编号计算，跳过不会生成图层的原始群。
 
-  const scoresByReserve = new Map(); // reserveId -> Map<key, number[]>
+  const MALE = 1;
+  const FEMALE = 2;
+  const GENDER_SYMBOL = { [MALE]: "♂", [FEMALE]: "♀" };
+  const individualsByReserve = new Map(); // reserveId -> Map<key, Individual[]>
   const keyOf = (...parts) => JSON.stringify(parts.map(String));
   const mapGroupKey = (populationId, spawnAreaId, groupIndex) =>
     keyOf(populationId, spawnAreaId, groupIndex);
@@ -147,7 +151,7 @@
     }
   }
 
-  let scoresVersion = 0;
+  let individualsVersion = 0;
 
   function captureScores(reserveData, saveName) {
     const reserveId = `r${saveName.match(/\d+/)?.[0] ?? ""}`;
@@ -193,19 +197,23 @@
           if (pageIndex === undefined) continue;
 
           const spawnAreaId = String(group.SpawnAreadId);
-          const scores = (group.Animals ?? [])
-            .map((animal) => animal?.Score)
-            .filter(Number.isFinite)
-            .sort((a, b) => b - a);
-          if (scores.length)
-            table.set(keyOf(name, spawnAreaId, pageIndex), scores);
+          const individuals = (group.Animals ?? [])
+            .map((animal) => ({
+              score: Number(animal?.Score),
+              weight: Number(animal?.Weight),
+              gender: Number(animal?.Gender),
+            }))
+            .filter((individual) => Number.isFinite(individual.score))
+            .sort((a, b) => b.score - a.score);
+          if (individuals.length)
+            table.set(keyOf(name, spawnAreaId, pageIndex), individuals);
         }
       }
     }
 
-    // 覆盖空表也能清除该保护区先前缓存，避免新存档沿用旧分数。
-    scoresByReserve.set(reserveId, table);
-    scoresVersion += 1;
+    // 覆盖空表也能清除该保护区先前缓存，避免新存档沿用旧数据。
+    individualsByReserve.set(reserveId, table);
+    individualsVersion += 1;
     queueRebuild();
   }
 
@@ -236,7 +244,7 @@
 
   // —— 索引缓存：树重建时构建，预览/筛选不再反复查 DOM ——
 
-  let groupCache = []; // [{cb, name, scores: number[]|null}]
+  let groupCache = []; // [{cb, name, individuals: Individual[]|null}]
   const popNameCache = new Map();
 
   function nameOfGroup(cb) {
@@ -251,8 +259,8 @@
     return name;
   }
 
-  function lookupScores(name, { spawnAreaId, groupIndex }) {
-    const table = scoresByReserve.get(currentReserveId());
+  function lookupIndividuals(name, { spawnAreaId, groupIndex }) {
+    const table = individualsByReserve.get(currentReserveId());
     return table?.get(keyOf(name, spawnAreaId, groupIndex)) ?? null;
   }
 
@@ -262,7 +270,7 @@
   style.textContent = `
         #cotw-filter-panel {
             position: fixed; top: 12px; right: 12px; z-index: 10000;
-            width: 250px; background: rgba(20, 24, 28, 0.88); color: #eee;
+            width: 280px; background: rgba(20, 24, 28, 0.88); color: #eee;
             border-radius: 8px; font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
             box-shadow: 0 2px 10px rgba(0,0,0,0.45); user-select: none;
         }
@@ -291,6 +299,12 @@
         #cotw-selected-save-actions button { flex: 1; width: auto; min-width: 0; }
         .cotw-range { display: flex; gap: 8px; }
         .cotw-range > div { flex: 1; }
+        .cotw-genders { display: flex; gap: 18px; }
+        #cotw-filter-body .cotw-genders label {
+            display: inline-flex; align-items: center; gap: 4px;
+            margin: 0; font-size: 12px; color: #eee;
+        }
+        #cotw-filter-body .cotw-genders input { width: auto; }
         #cotw-status { margin-top: 8px; font-size: 12px; color: #9fd3a4; min-height: 1.2em; word-break: break-all; }
         #cotw-area-info { margin-top: 10px; padding-top: 8px; border-top: 1px solid #566; }
         #cotw-area-results { max-height: 220px; overflow-y: auto; margin-top: 4px; user-select: text; }
@@ -303,6 +317,10 @@
         .cotw-area-score { padding: 1px 4px; border-radius: 3px; background: rgba(255,255,255,0.12); }
         #pop_nav ul.cotw-animals { padding-left: 20px; }
         #pop_nav ul.cotw-animals > li { font-size: 12px; color: #555; padding: 1px 0; }
+        #pop_nav ul.cotw-animals > li.cotw-male { color: #4a90e2; }
+        #pop_nav ul.cotw-animals > li.cotw-female { color: #e26a9a; }
+        .cotw-area-score.cotw-male { color: #4a90e2; }
+        .cotw-area-score.cotw-female { color: #e26a9a; }
         #pop_nav .cotw-caret { cursor: pointer; }
     `;
   document.head.appendChild(style);
@@ -323,6 +341,15 @@
                 <div><label>最小分数</label><input id="cotw-min" type="number" step="0.1" placeholder="不限"></div>
                 <div><label>最大分数</label><input id="cotw-max" type="number" step="0.1" placeholder="不限"></div>
             </div>
+            <div class="cotw-range">
+                <div><label>最小体重</label><input id="cotw-weight-min" type="number" step="0.1" placeholder="不限"></div>
+                <div><label>最大体重</label><input id="cotw-weight-max" type="number" step="0.1" placeholder="不限"></div>
+            </div>
+            <label>性别</label>
+            <div class="cotw-genders">
+                <label><input id="cotw-gender-male" type="checkbox" checked> 公 ♂</label>
+                <label><input id="cotw-gender-female" type="checkbox" checked> 母 ♀</label>
+            </div>
             <button id="cotw-apply">筛选并勾选</button>
             <button id="cotw-clear" class="cotw-secondary">全部取消</button>
             <div id="cotw-status"></div>
@@ -338,6 +365,10 @@
   const selSpecies = $("#cotw-species", panel);
   const inpMin = $("#cotw-min", panel);
   const inpMax = $("#cotw-max", panel);
+  const inpWeightMin = $("#cotw-weight-min", panel);
+  const inpWeightMax = $("#cotw-weight-max", panel);
+  const chkMale = $("#cotw-gender-male", panel);
+  const chkFemale = $("#cotw-gender-female", panel);
   const btnApply = $("#cotw-apply", panel);
   const btnClear = $("#cotw-clear", panel);
   const btnSelectSave = $("#cotw-select-save", panel);
@@ -397,23 +428,50 @@
     header.releasePointerCapture(e.pointerId);
   });
 
-  // —— 分数区间 ——
+  // —— 筛选条件 ——
 
   const boundValue = (inp) => {
     const v = inp.value.trim();
     return v === "" ? null : parseFloat(v);
   };
 
-  function makeRangeMatcher() {
-    const min = boundValue(inpMin);
-    const max = boundValue(inpMax);
-    return (score) =>
-      Number.isFinite(score) &&
-      (min === null || score >= min) &&
-      (max === null || score <= max);
+  // 边界包含在范围内；两侧都留空表示该维度不限制
+  const inRange = (value, min, max) => {
+    if (min === null && max === null) return true;
+    return (
+      Number.isFinite(value) &&
+      (min === null || value >= min) &&
+      (max === null || value <= max)
+    );
+  };
+
+  // 把面板上的三组条件收敛成一个过滤器。
+  // 体重和性别只存在于个体数据里，地图行文本只有 Max Score，
+  // 所以缺个体数据的兽群在这些条件生效时不能回退猜测。
+  function makeFilter() {
+    const scoreMin = boundValue(inpMin);
+    const scoreMax = boundValue(inpMax);
+    const weightMin = boundValue(inpWeightMin);
+    const weightMax = boundValue(inpWeightMax);
+    const genders = new Set();
+    if (chkMale.checked) genders.add(MALE);
+    if (chkFemale.checked) genders.add(FEMALE);
+    // 两个都勾或都不勾都表示不限性别
+    const onlyGenders = genders.size === 1 ? genders : null;
+    const hasWeightRange = weightMin !== null || weightMax !== null;
+
+    return {
+      needsIndividuals: hasWeightRange || onlyGenders !== null,
+      test: (individual) =>
+        inRange(individual.score, scoreMin, scoreMax) &&
+        inRange(individual.weight, weightMin, weightMax) &&
+        (onlyGenders === null || onlyGenders.has(individual.gender)),
+      testFallback: (maxScore) =>
+        !hasWeightRange && inRange(maxScore, scoreMin, scoreMax),
+    };
   }
 
-  // —— 地图点击区域的个体分数 ——
+  // —— 地图点击区域的个体信息 ——
 
   let selectedAreaEntries = [];
   let areaEmptyText = "";
@@ -543,25 +601,26 @@
       meta.textContent = details.join(" · ");
       block.appendChild(meta);
 
-      if (group?.scores?.length) {
+      if (group?.individuals?.length) {
         const scoreTitle = document.createElement("div");
         scoreTitle.className = "cotw-area-meta";
-        scoreTitle.textContent = `个体分数（${group.scores.length} 只）`;
+        scoreTitle.textContent = `个体（${group.individuals.length} 只）`;
         block.appendChild(scoreTitle);
 
-        const scores = document.createElement("div");
-        scores.className = "cotw-area-scores";
-        for (const score of group.scores) {
+        const chips = document.createElement("div");
+        chips.className = "cotw-area-scores";
+        for (const individual of group.individuals) {
+          const { text, genderClass } = individualView(individual);
           const chip = document.createElement("span");
-          chip.className = "cotw-area-score";
-          chip.textContent = score.toFixed(1);
-          scores.appendChild(chip);
+          chip.className = `cotw-area-score ${genderClass}`.trim();
+          chip.textContent = text;
+          chips.appendChild(chip);
         }
-        block.appendChild(scores);
+        block.appendChild(chips);
       } else {
         const unavailable = document.createElement("div");
         unavailable.className = "cotw-area-meta";
-        unavailable.textContent = "个体分数不可用";
+        unavailable.textContent = "个体数据不可用";
         if (
           typeof entry.maxScore === "number" &&
           Number.isFinite(entry.maxScore)
@@ -576,11 +635,28 @@
 
   // —— 个体层渲染 ——
 
-  function syncGroupScoreRows(li, scores) {
+  // 个体显示：性别符号 + 分数/体重kg，公母各用一个颜色类
+  function individualView(individual) {
+    const symbol = GENDER_SYMBOL[individual.gender] ?? "?";
+    const weight = Number.isFinite(individual.weight)
+      ? `/${individual.weight.toFixed(1)}kg`
+      : "";
+    return {
+      text: `${symbol} ${individual.score.toFixed(1)}${weight}`,
+      genderClass:
+        individual.gender === MALE
+          ? "cotw-male"
+          : individual.gender === FEMALE
+            ? "cotw-female"
+            : "",
+    };
+  }
+
+  function syncGroupIndividuals(li, individuals) {
     let list = $(":scope > ul.cotw-animals", li);
     const caret = $(":scope > .nav-spacer, :scope > .cotw-caret", li);
 
-    if (!scores?.length) {
+    if (!individuals?.length) {
       list?.remove();
       if (caret) caret.className = "nav-spacer";
       return;
@@ -592,10 +668,11 @@
       li.append(list);
     }
     list.replaceChildren(
-      ...scores.map((score) => {
+      ...individuals.map((individual) => {
+        const { text, genderClass } = individualView(individual);
         const row = document.createElement("li");
-        row.textContent = score.toFixed(1);
-        row.dataset.score = score;
+        if (genderClass) row.className = genderClass;
+        row.textContent = text;
         return row;
       }),
     );
@@ -619,19 +696,19 @@
 
   async function rebuildIndex(inputs) {
     const token = ++rebuildToken;
-    const version = scoresVersion;
+    const version = individualsVersion;
     popNameCache.clear();
     const cache = [];
     const cacheByMapKey = new Map();
 
     const completed = await runBatches(inputs, (cb) => {
-      if (token !== rebuildToken || version !== scoresVersion) return false;
+      if (token !== rebuildToken || version !== individualsVersion) return false;
       const li = cb.closest("li");
       const name = nameOfGroup(cb);
-      const scores = name ? lookupScores(name, cb.dataset) : null;
+      const individuals = name ? lookupIndividuals(name, cb.dataset) : null;
 
-      if (li) syncGroupScoreRows(li, scores);
-      const group = { cb, name, scores: scores ?? null };
+      if (li) syncGroupIndividuals(li, individuals);
+      const group = { cb, name, individuals: individuals ?? null };
       cache.push(group);
       const { populationId, spawnAreaId, groupIndex } = cb.dataset;
       if (populationId && spawnAreaId && groupIndex) {
@@ -642,7 +719,7 @@
       }
     });
 
-    if (!completed || token !== rebuildToken || version !== scoresVersion)
+    if (!completed || token !== rebuildToken || version !== individualsVersion)
       return false;
     groupCache = cache;
     groupCacheByMapKey = cacheByMapKey;
@@ -683,25 +760,29 @@
 
   function summarize(
     groups = groupCache.filter((g) => g.name === selSpecies.value),
-    matchesScore = makeRangeMatcher(),
+    filter = makeFilter(),
   ) {
     let passing = 0;
     let hits = 0;
     let preciseGroups = 0;
     let fallbackGroups = 0;
+    let unjudgedGroups = 0;
 
     for (const group of groups) {
-      if (group.scores?.length) {
+      if (group.individuals?.length) {
         preciseGroups += 1;
-        const matched = group.scores.filter(matchesScore).length;
+        const matched = group.individuals.filter(filter.test).length;
         if (matched > 0) {
           passing += 1;
           hits += matched;
         }
-      } else {
-        fallbackGroups += 1;
-        if (matchesScore(parseScore(group.cb))) passing += 1;
+        continue;
       }
+
+      // 缺个体数据：只用分数条件时能按地图上的最高分回退，用了体重/性别就只能放弃判断
+      fallbackGroups += 1;
+      if (filter.needsIndividuals) unjudgedGroups += 1;
+      else if (filter.testFallback(parseScore(group.cb))) passing += 1;
     }
     return {
       total: groups.length,
@@ -709,6 +790,7 @@
       hits,
       preciseGroups,
       fallbackGroups,
+      unjudgedGroups,
     };
   }
 
@@ -718,11 +800,13 @@
     hits,
     preciseGroups,
     fallbackGroups,
+    unjudgedGroups,
   }) {
     const prefix = `${total} 群 · 达标 ${passing} 群`;
+    const unjudged = unjudgedGroups ? ` · 无法判断 ${unjudgedGroups} 群` : "";
     if (fallbackGroups === 0) return `${prefix} · 命中 ${hits} 只`;
-    if (preciseGroups === 0) return `${prefix} · 按最高分`;
-    return `${prefix} · 个体分数 ${preciseGroups} 群 · 最高分回退 ${fallbackGroups} 群 · 精确命中 ${hits} 只`;
+    if (preciseGroups === 0) return `${prefix}${unjudged || " · 按最高分"}`;
+    return `${prefix} · 个体分数 ${preciseGroups} 群 · 最高分回退 ${fallbackGroups} 群 · 精确命中 ${hits} 只${unjudged}`;
   }
 
   function updatePreview() {
@@ -745,17 +829,18 @@
       return;
     }
 
-    const matchesScore = makeRangeMatcher();
-    const summary = summarize(groups, matchesScore);
+    const filter = makeFilter();
+    const summary = summarize(groups, filter);
     operationInFlight = true;
     updateActionControls();
 
     try {
       const completed = await runBatches(groups, (group, index) => {
         if (groupCache !== sourceCache || !group.cb.isConnected) return false;
-        const want = group.scores?.length
-          ? group.scores.some(matchesScore)
-          : matchesScore(parseScore(group.cb));
+        const want = group.individuals?.length
+          ? group.individuals.some(filter.test)
+          : !filter.needsIndividuals &&
+            filter.testFallback(parseScore(group.cb));
         setChecked(group.cb, want);
         if (index % 16 === 0)
           status.textContent = `筛选中 ${index}/${groups.length}`;
@@ -874,6 +959,10 @@
     selSpecies.disabled = operationInFlight;
     inpMin.disabled = operationInFlight;
     inpMax.disabled = operationInFlight;
+    inpWeightMin.disabled = operationInFlight;
+    inpWeightMax.disabled = operationInFlight;
+    chkMale.disabled = operationInFlight;
+    chkFemale.disabled = operationInFlight;
   }
 
   function pageSaveMapping() {
@@ -1054,8 +1143,12 @@
   btnApply.addEventListener("click", () => void applyFilter());
   btnClear.addEventListener("click", clearAll);
   selSpecies.addEventListener("change", updatePreview);
-  inpMin.addEventListener("input", updatePreview);
-  inpMax.addEventListener("input", updatePreview);
+  [inpMin, inpMax, inpWeightMin, inpWeightMax].forEach((input) =>
+    input.addEventListener("input", updatePreview),
+  );
+  [chkMale, chkFemale].forEach((checkbox) =>
+    checkbox.addEventListener("change", updatePreview),
+  );
 
   // —— 树重建（拖入存档 / 切换地图）后重建索引 ——
 
@@ -1088,7 +1181,7 @@
       const signatures = inputs.map(groupInputSignature);
       const unchanged =
         root === processedTree &&
-        scoresVersion === processedVersion &&
+        individualsVersion === processedVersion &&
         inputs.length === processedInputs.length &&
         inputs.every(
           (input, index) =>
@@ -1098,7 +1191,7 @@
       if (unchanged) return;
 
       processedTree = root;
-      processedVersion = scoresVersion;
+      processedVersion = individualsVersion;
       processedInputs = inputs;
       processedSignatures = signatures;
 
