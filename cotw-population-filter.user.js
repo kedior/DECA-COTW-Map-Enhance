@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      1.5.0
-// @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数与手动刷新存档
+// @version      1.6.0
+// @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数、筛选条件预设与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
 // @run-at       document-idle
@@ -305,6 +305,35 @@
             margin: 0; font-size: 12px; color: #eee;
         }
         #cotw-filter-body .cotw-genders input { width: auto; }
+        #cotw-filter-body .cotw-preset-row { display: flex; gap: 8px; }
+        #cotw-filter-body .cotw-preset-row select { flex: 1; min-width: 0; width: auto; }
+        #cotw-filter-body .cotw-preset-row button {
+            width: auto; flex: none; margin-top: 0; padding: 7px 10px; font-size: 12px;
+        }
+        .cotw-preset-dialog {
+            position: absolute; inset: 0; z-index: 10; box-sizing: border-box;
+            display: flex; align-items: center; justify-content: center; padding: 12px;
+            background: rgba(0, 0, 0, 0.6); border-radius: 8px; user-select: text;
+        }
+        .cotw-preset-dialog[hidden] { display: none; }
+        .cotw-dialog-card {
+            width: 100%; padding: 10px; border: 1px solid #556; border-radius: 6px;
+            background: #1b2026;
+        }
+        .cotw-dialog-title { margin-bottom: 6px; font-weight: 600; }
+        .cotw-dialog-card input {
+            width: 100%; box-sizing: border-box; padding: 5px 6px;
+            border: 1px solid #555; border-radius: 4px; background: #fff; color: #222;
+            font-size: 13px;
+        }
+        .cotw-dialog-error { min-height: 1.2em; margin-top: 4px; font-size: 12px; color: #ff8f8f; }
+        .cotw-dialog-actions { display: flex; gap: 8px; margin-top: 2px; }
+        .cotw-dialog-actions button {
+            flex: 1; width: auto; margin-top: 0; padding: 7px 0; border: 0; border-radius: 4px;
+            background: #2f8f3e; color: #fff; font-size: 13px; cursor: pointer;
+        }
+        .cotw-dialog-actions button.cotw-secondary { background: #555f66; }
+        .cotw-dialog-actions button:hover { filter: brightness(1.12); }
         #cotw-status { margin-top: 8px; font-size: 12px; color: #9fd3a4; min-height: 1.2em; word-break: break-all; }
         #cotw-area-info { margin-top: 10px; padding-top: 8px; border-top: 1px solid #566; }
         #cotw-area-results { max-height: 220px; overflow-y: auto; margin-top: 4px; user-select: text; }
@@ -337,6 +366,12 @@
             </div>
             <label>物种</label>
             <select id="cotw-species"></select>
+            <label>筛选条件</label>
+            <div class="cotw-preset-row">
+                <select id="cotw-preset"></select>
+                <button id="cotw-preset-save" class="cotw-secondary">保存</button>
+                <button id="cotw-preset-delete" class="cotw-secondary">删除</button>
+            </div>
             <div class="cotw-range">
                 <div><label>最小分数</label><input id="cotw-min" type="number" step="0.1" placeholder="不限"></div>
                 <div><label>最大分数</label><input id="cotw-max" type="number" step="0.1" placeholder="不限"></div>
@@ -357,12 +392,31 @@
                 <div id="cotw-area-results"></div>
             </div>
         </div>
+        <div id="cotw-preset-dialog" class="cotw-preset-dialog" hidden>
+            <div class="cotw-dialog-card">
+                <div class="cotw-dialog-title">保存筛选条件</div>
+                <input id="cotw-preset-name" type="text" maxlength="20" placeholder="条件名称">
+                <div id="cotw-preset-error" class="cotw-dialog-error"></div>
+                <div class="cotw-dialog-actions">
+                    <button id="cotw-preset-cancel" class="cotw-secondary">取消</button>
+                    <button id="cotw-preset-confirm">保存</button>
+                </div>
+            </div>
+        </div>
     `;
   document.body.appendChild(panel);
 
   const header = $("#cotw-filter-header", panel);
   const toggle = $("#cotw-filter-toggle", panel);
   const selSpecies = $("#cotw-species", panel);
+  const selPreset = $("#cotw-preset", panel);
+  const btnSavePreset = $("#cotw-preset-save", panel);
+  const btnDeletePreset = $("#cotw-preset-delete", panel);
+  const presetDialog = $("#cotw-preset-dialog", panel);
+  const inpPresetName = $("#cotw-preset-name", panel);
+  const presetError = $("#cotw-preset-error", panel);
+  const btnPresetCancel = $("#cotw-preset-cancel", panel);
+  const btnPresetConfirm = $("#cotw-preset-confirm", panel);
   const inpMin = $("#cotw-min", panel);
   const inpMax = $("#cotw-max", panel);
   const inpWeightMin = $("#cotw-weight-min", panel);
@@ -469,6 +523,149 @@
       testFallback: (maxScore) =>
         !hasWeightRange && inRange(maxScore, scoreMin, scoreMax),
     };
+  }
+
+  // —— 筛选条件预设 ——
+  // 只存四个数值框和性别，物种不进预设；套用预设只替换数值，不触发勾选。
+
+  const PRESET_STORAGE_KEY = "cotw-filter-presets";
+  let presets = [];
+
+  const finiteOrNull = (value) =>
+    typeof value === "number" && Number.isFinite(value) ? value : null;
+
+  function normalizePreset(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const name = typeof raw.name === "string" ? raw.name.trim() : "";
+    if (!name) return null;
+    return {
+      name,
+      scoreMin: finiteOrNull(raw.scoreMin),
+      scoreMax: finiteOrNull(raw.scoreMax),
+      weightMin: finiteOrNull(raw.weightMin),
+      weightMax: finiteOrNull(raw.weightMax),
+      male: raw.male !== false,
+      female: raw.female !== false,
+    };
+  }
+
+  function loadPresets() {
+    try {
+      const parsed = JSON.parse(
+        localStorage.getItem(PRESET_STORAGE_KEY) ?? "[]",
+      );
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map(normalizePreset).filter(Boolean);
+    } catch (error) {
+      console.warn("[COTW 种群分数筛选] 无法读取保存的筛选条件", error);
+      return [];
+    }
+  }
+
+  function persistPresets() {
+    try {
+      localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets));
+    } catch (error) {
+      console.warn("[COTW 种群分数筛选] 无法保存筛选条件", error);
+    }
+  }
+
+  // 当前面板上的四项条件，不含物种
+  function currentConditions() {
+    return {
+      scoreMin: finiteOrNull(boundValue(inpMin)),
+      scoreMax: finiteOrNull(boundValue(inpMax)),
+      weightMin: finiteOrNull(boundValue(inpWeightMin)),
+      weightMax: finiteOrNull(boundValue(inpWeightMax)),
+      male: chkMale.checked,
+      female: chkFemale.checked,
+    };
+  }
+
+  const fillConditionInput = (inp, value) => {
+    inp.value = value === null || value === undefined ? "" : String(value);
+  };
+
+  // 只替换数值和性别，不勾选也不取消；状态栏跟着刷新预览
+  function applyPreset(preset) {
+    fillConditionInput(inpMin, preset.scoreMin);
+    fillConditionInput(inpMax, preset.scoreMax);
+    fillConditionInput(inpWeightMin, preset.weightMin);
+    fillConditionInput(inpWeightMax, preset.weightMax);
+    chkMale.checked = preset.male;
+    chkFemale.checked = preset.female;
+    updatePreview();
+  }
+
+  function refreshPresetOptions(selectName = null) {
+    const previous = selectName ?? selPreset.value;
+    selPreset.replaceChildren();
+
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = presets.length
+      ? "选择已保存条件"
+      : "暂无保存的条件";
+    selPreset.appendChild(placeholder);
+
+    for (const preset of presets) {
+      const option = document.createElement("option");
+      option.value = preset.name;
+      option.textContent = preset.name;
+      selPreset.appendChild(option);
+    }
+    selPreset.value = presets.some((preset) => preset.name === previous)
+      ? previous
+      : "";
+    updateActionControls();
+  }
+
+  // 手动改动任意条件后，下拉框退回默认项，避免显示与实际数值不符的预设名
+  function resetPresetSelection() {
+    if (!selPreset.value) return;
+    selPreset.value = "";
+    updateActionControls();
+  }
+
+  function openPresetDialog() {
+    if (operationInFlight) return;
+    inpPresetName.value = selPreset.value;
+    presetError.textContent = "";
+    presetDialog.hidden = false;
+    inpPresetName.focus();
+    inpPresetName.select();
+  }
+
+  function closePresetDialog() {
+    presetDialog.hidden = true;
+    presetError.textContent = "";
+  }
+
+  function confirmPresetSave() {
+    const name = inpPresetName.value.trim();
+    if (!name) {
+      presetError.textContent = "请输入条件名称";
+      return;
+    }
+    if (presets.some((preset) => preset.name === name)) {
+      presetError.textContent = "已存在同名条件，请换一个名字";
+      return;
+    }
+
+    presets.push({ name, ...currentConditions() });
+    persistPresets();
+    refreshPresetOptions(name);
+    closePresetDialog();
+    status.textContent = `已保存条件：${name}`;
+  }
+
+  function deleteSelectedPreset() {
+    const name = selPreset.value;
+    if (!name) return;
+    presets = presets.filter((preset) => preset.name !== name);
+    persistPresets();
+    refreshPresetOptions("");
+    status.textContent = `已删除条件：${name}`;
   }
 
   // —— 地图点击区域的个体信息 ——
@@ -702,7 +899,8 @@
     const cacheByMapKey = new Map();
 
     const completed = await runBatches(inputs, (cb) => {
-      if (token !== rebuildToken || version !== individualsVersion) return false;
+      if (token !== rebuildToken || version !== individualsVersion)
+        return false;
       const li = cb.closest("li");
       const name = nameOfGroup(cb);
       const individuals = name ? lookupIndividuals(name, cb.dataset) : null;
@@ -834,6 +1032,7 @@
     operationInFlight = true;
     updateActionControls();
 
+    let added = 0;
     try {
       const completed = await runBatches(groups, (group, index) => {
         if (groupCache !== sourceCache || !group.cb.isConnected) return false;
@@ -841,7 +1040,11 @@
           ? group.individuals.some(filter.test)
           : !filter.needsIndividuals &&
             filter.testFallback(parseScore(group.cb));
-        setChecked(group.cb, want);
+        // 只追加勾选，不取消任何已有勾选
+        if (want && !group.cb.checked) {
+          setChecked(group.cb, true);
+          added += 1;
+        }
         if (index % 16 === 0)
           status.textContent = `筛选中 ${index}/${groups.length}`;
       });
@@ -861,7 +1064,7 @@
         $$("ul.nested", popRow).forEach((list) => list.classList.add("active"));
       }
 
-      status.textContent = summaryText(summary);
+      status.textContent = `${summaryText(summary)} · 新增勾选 ${added} 群`;
     } catch (error) {
       status.textContent = "筛选失败";
       console.error("[COTW 种群分数筛选] 应用筛选失败", error);
@@ -963,6 +1166,9 @@
     inpWeightMax.disabled = operationInFlight;
     chkMale.disabled = operationInFlight;
     chkFemale.disabled = operationInFlight;
+    selPreset.disabled = operationInFlight || presets.length === 0;
+    btnSavePreset.disabled = operationInFlight;
+    btnDeletePreset.disabled = operationInFlight || !selPreset.value;
   }
 
   function pageSaveMapping() {
@@ -1144,11 +1350,36 @@
   btnClear.addEventListener("click", clearAll);
   selSpecies.addEventListener("change", updatePreview);
   [inpMin, inpMax, inpWeightMin, inpWeightMax].forEach((input) =>
-    input.addEventListener("input", updatePreview),
+    input.addEventListener("input", () => {
+      resetPresetSelection();
+      updatePreview();
+    }),
   );
   [chkMale, chkFemale].forEach((checkbox) =>
-    checkbox.addEventListener("change", updatePreview),
+    checkbox.addEventListener("change", () => {
+      resetPresetSelection();
+      updatePreview();
+    }),
   );
+
+  selPreset.addEventListener("change", () => {
+    const preset = presets.find((item) => item.name === selPreset.value);
+    if (preset) applyPreset(preset);
+    updateActionControls();
+  });
+  btnSavePreset.addEventListener("click", openPresetDialog);
+  btnDeletePreset.addEventListener("click", deleteSelectedPreset);
+  btnPresetCancel.addEventListener("click", closePresetDialog);
+  btnPresetConfirm.addEventListener("click", confirmPresetSave);
+  inpPresetName.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      confirmPresetSave();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closePresetDialog();
+    }
+  });
 
   // —— 树重建（拖入存档 / 切换地图）后重建索引 ——
 
@@ -1265,6 +1496,10 @@
       subtree: true,
     });
   }
+
+  // 恢复上次保存的筛选条件预设
+  presets = loadPresets();
+  refreshPresetOptions();
 
   hookSaveParser();
   void onTreeChanged();
