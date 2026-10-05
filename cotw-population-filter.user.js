@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      1.6.0
-// @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数、筛选条件预设与手动刷新存档
+// @version      1.7.0
+// @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数、已选个体列表、筛选条件预设与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
 // @run-at       document-idle
@@ -16,6 +16,11 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
   const yieldToUI = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  // 主操作（筛选 / 清空 / 存档读取）进行中，期间禁用按钮
+  let operationInFlight = false;
+  // 当前选中的存档文件句柄，顶部要显示它对应的存档名
+  let selectedSaveHandle = null;
 
   // 分片执行：按时间预算让出主线程，避免长任务卡住页面
   async function runBatches(items, worker, budgetMs = 8) {
@@ -74,6 +79,9 @@
   const MALE = 1;
   const FEMALE = 2;
   const GENDER_SYMBOL = { [MALE]: "♂", [FEMALE]: "♀" };
+  // 公母配色：蓝 = 公，粉 = 母
+  const genderClass = (gender) =>
+    gender === MALE ? "cotw-male" : gender === FEMALE ? "cotw-female" : "";
   const individualsByReserve = new Map(); // reserveId -> Map<key, Individual[]>
   const keyOf = (...parts) => JSON.stringify(parts.map(String));
   const mapGroupKey = (populationId, spawnAreaId, groupIndex) =>
@@ -270,16 +278,55 @@
   style.textContent = `
         #cotw-filter-panel {
             position: fixed; top: 12px; right: 12px; z-index: 10000;
-            width: 280px; background: rgba(20, 24, 28, 0.88); color: #eee;
+            display: flex; flex-direction: column; max-height: calc(100vh - 24px);
+            background: rgba(20, 24, 28, 0.88); color: #eee;
             border-radius: 8px; font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
             box-shadow: 0 2px 10px rgba(0,0,0,0.45); user-select: none;
         }
         #cotw-filter-header {
             padding: 8px 12px; cursor: move; font-weight: 600;
-            display: flex; justify-content: space-between; align-items: center;
+            display: flex; align-items: center; gap: 8px;
         }
-        #cotw-filter-body { padding: 0 12px 12px; }
-        #cotw-filter-panel.collapsed #cotw-filter-body { display: none; }
+        #cotw-filter-header > span:first-child, #cotw-filter-toggle { flex: none; }
+        #cotw-header-info {
+            flex: 1 1 auto; min-width: 0; text-align: right; font-weight: 400; font-size: 12px;
+            color: #9fd3a4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        #cotw-panel-columns { display: flex; position: relative; min-height: 0; }
+        #cotw-filter-body {
+            position: relative; width: 280px; box-sizing: border-box; padding: 0 12px 12px;
+            margin-left: 236px; overflow-y: auto;
+        }
+        #cotw-filter-panel.collapsed #cotw-panel-columns { display: none; }
+        /* 左栏脱离文档流：面板高度只由右栏撑开，列表再长也不会拉高面板 */
+        #cotw-selected-panel {
+            position: absolute; top: 0; bottom: 0; left: 0;
+            display: flex; flex-direction: column; min-height: 0;
+            width: 236px; box-sizing: border-box; padding: 0 8px 8px;
+            border-right: 1px solid rgba(255, 255, 255, 0.14);
+        }
+        .cotw-selected-toolbar { display: flex; align-items: center; gap: 6px; }
+        #cotw-selected-panel button {
+            width: auto; margin-top: 0; padding: 4px 8px; border: 0; border-radius: 4px;
+            background: #555f66; color: #fff; font-size: 12px; cursor: pointer;
+        }
+        #cotw-selected-panel button:hover { filter: brightness(1.12); }
+        #cotw-selected-panel button:disabled { opacity: 0.45; cursor: default; filter: none; }
+        #cotw-selected-panel button.cotw-sort-active { background: #2f8f3e; }
+        .cotw-selected-sort { display: flex; gap: 4px; margin-left: auto; }
+        #cotw-selected-list { margin-top: 6px; flex: 1; min-height: 0; overflow-y: auto; }
+        .cotw-sel-row {
+            display: grid; grid-template-columns: auto 7em 5ch 8ch;
+            align-items: center; gap: 6px; padding: 2px 0; font-size: 12px; cursor: pointer;
+        }
+        .cotw-sel-row input { width: auto; margin: 0; }
+        .cotw-sel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cotw-sel-name.cotw-male { color: #4a90e2; }
+        .cotw-sel-name.cotw-female { color: #e26a9a; }
+        .cotw-sel-score, .cotw-sel-weight {
+            text-align: left; font-variant-numeric: tabular-nums;
+        }
+        #cotw-selected-empty { padding: 6px 0; color: #888; font-size: 12px; }
         #cotw-filter-body label {
             display: block; margin: 8px 0 2px; font-size: 12px; color: #bbb;
         }
@@ -334,7 +381,8 @@
         }
         .cotw-dialog-actions button.cotw-secondary { background: #555f66; }
         .cotw-dialog-actions button:hover { filter: brightness(1.12); }
-        #cotw-status { margin-top: 8px; font-size: 12px; color: #9fd3a4; min-height: 1.2em; word-break: break-all; }
+        #cotw-status { margin-top: 8px; font-size: 12px; color: #ffcf7a; word-break: break-all; }
+        #cotw-status:empty { display: none; }
         #cotw-area-info { margin-top: 10px; padding-top: 8px; border-top: 1px solid #566; }
         #cotw-area-results { max-height: 220px; overflow-y: auto; margin-top: 4px; user-select: text; }
         .cotw-area-empty { color: #aaa; font-size: 12px; }
@@ -357,49 +405,63 @@
   const panel = document.createElement("div");
   panel.id = "cotw-filter-panel";
   panel.innerHTML = `
-        <div id="cotw-filter-header"><span>🦌 种群分数筛选</span><span id="cotw-filter-toggle">−</span></div>
-        <div id="cotw-filter-body">
-            <button id="cotw-select-save" class="cotw-secondary">选择存档文件</button>
-            <div id="cotw-selected-save-actions" hidden>
-                <button id="cotw-reselect-save" class="cotw-secondary">重新选择存档</button>
-                <button id="cotw-refresh-save">刷新存档</button>
+        <div id="cotw-filter-header"><span>🦌 种群筛选</span><span id="cotw-header-info"></span><span id="cotw-filter-toggle">−</span></div>
+        <div id="cotw-panel-columns">
+            <div id="cotw-selected-panel">
+                <div class="cotw-selected-toolbar">
+                    <button id="cotw-select-all">全选</button>
+                    <button id="cotw-select-none">全不选</button>
+                    <span class="cotw-selected-sort">
+                        <button id="cotw-sort-score">分数↓</button>
+                        <button id="cotw-sort-weight">体重↓</button>
+                    </span>
+                </div>
+                <div id="cotw-selected-list"></div>
+                <div id="cotw-selected-empty">还没有加入的个体</div>
             </div>
-            <label>物种</label>
-            <select id="cotw-species"></select>
-            <label>筛选条件</label>
-            <div class="cotw-preset-row">
-                <select id="cotw-preset"></select>
-                <button id="cotw-preset-save" class="cotw-secondary">保存</button>
-                <button id="cotw-preset-delete" class="cotw-secondary">删除</button>
-            </div>
-            <div class="cotw-range">
-                <div><label>最小分数</label><input id="cotw-min" type="number" step="0.1" placeholder="不限"></div>
-                <div><label>最大分数</label><input id="cotw-max" type="number" step="0.1" placeholder="不限"></div>
-            </div>
-            <div class="cotw-range">
-                <div><label>最小体重</label><input id="cotw-weight-min" type="number" step="0.1" placeholder="不限"></div>
-                <div><label>最大体重</label><input id="cotw-weight-max" type="number" step="0.1" placeholder="不限"></div>
-            </div>
-            <label>性别</label>
-            <div class="cotw-genders">
-                <label><input id="cotw-gender-male" type="checkbox" checked> 公 ♂</label>
-                <label><input id="cotw-gender-female" type="checkbox" checked> 母 ♀</label>
-            </div>
-            <button id="cotw-apply">筛选并勾选</button>
-            <button id="cotw-clear" class="cotw-secondary">全部取消</button>
-            <div id="cotw-status"></div>
-            <div id="cotw-area-info" hidden>
-                <div id="cotw-area-results"></div>
-            </div>
-        </div>
-        <div id="cotw-preset-dialog" class="cotw-preset-dialog" hidden>
-            <div class="cotw-dialog-card">
-                <div class="cotw-dialog-title">保存筛选条件</div>
-                <input id="cotw-preset-name" type="text" maxlength="20" placeholder="条件名称">
-                <div id="cotw-preset-error" class="cotw-dialog-error"></div>
-                <div class="cotw-dialog-actions">
-                    <button id="cotw-preset-cancel" class="cotw-secondary">取消</button>
-                    <button id="cotw-preset-confirm">保存</button>
+            <div id="cotw-filter-body">
+                <button id="cotw-select-save" class="cotw-secondary">选择存档文件</button>
+                <div id="cotw-selected-save-actions" hidden>
+                    <button id="cotw-reselect-save" class="cotw-secondary">重新选择存档</button>
+                    <button id="cotw-refresh-save">刷新存档</button>
+                </div>
+                <label>物种</label>
+                <select id="cotw-species"></select>
+                <label>筛选条件</label>
+                <div class="cotw-preset-row">
+                    <select id="cotw-preset"></select>
+                    <button id="cotw-preset-save" class="cotw-secondary">保存</button>
+                    <button id="cotw-preset-delete" class="cotw-secondary">删除</button>
+                </div>
+                <div class="cotw-range">
+                    <div><label>最小分数</label><input id="cotw-min" type="number" step="0.1" placeholder="不限"></div>
+                    <div><label>最大分数</label><input id="cotw-max" type="number" step="0.1" placeholder="不限"></div>
+                </div>
+                <div class="cotw-range">
+                    <div><label>最小体重</label><input id="cotw-weight-min" type="number" step="0.1" placeholder="不限"></div>
+                    <div><label>最大体重</label><input id="cotw-weight-max" type="number" step="0.1" placeholder="不限"></div>
+                </div>
+                <label>性别</label>
+                <div class="cotw-genders">
+                    <label><input id="cotw-gender-male" type="checkbox" checked> 公 ♂</label>
+                    <label><input id="cotw-gender-female" type="checkbox" checked> 母 ♀</label>
+                </div>
+                <button id="cotw-apply">筛选并加入列表</button>
+                <button id="cotw-clear" class="cotw-secondary">清空列表</button>
+                <div id="cotw-status"></div>
+                <div id="cotw-area-info" hidden>
+                    <div id="cotw-area-results"></div>
+                </div>
+                <div id="cotw-preset-dialog" class="cotw-preset-dialog" hidden>
+                    <div class="cotw-dialog-card">
+                        <div class="cotw-dialog-title">保存筛选条件</div>
+                        <input id="cotw-preset-name" type="text" maxlength="20" placeholder="条件名称">
+                        <div id="cotw-preset-error" class="cotw-dialog-error"></div>
+                        <div class="cotw-dialog-actions">
+                            <button id="cotw-preset-cancel" class="cotw-secondary">取消</button>
+                            <button id="cotw-preset-confirm">保存</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -408,6 +470,13 @@
 
   const header = $("#cotw-filter-header", panel);
   const toggle = $("#cotw-filter-toggle", panel);
+  const headerInfo = $("#cotw-header-info", panel);
+  const selectedList = $("#cotw-selected-list", panel);
+  const selectedEmpty = $("#cotw-selected-empty", panel);
+  const btnSelectAll = $("#cotw-select-all", panel);
+  const btnSelectNone = $("#cotw-select-none", panel);
+  const btnSortScore = $("#cotw-sort-score", panel);
+  const btnSortWeight = $("#cotw-sort-weight", panel);
   const selSpecies = $("#cotw-species", panel);
   const selPreset = $("#cotw-preset", panel);
   const btnSavePreset = $("#cotw-preset-save", panel);
@@ -656,7 +725,6 @@
     persistPresets();
     refreshPresetOptions(name);
     closePresetDialog();
-    status.textContent = `已保存条件：${name}`;
   }
 
   function deleteSelectedPreset() {
@@ -665,7 +733,6 @@
     presets = presets.filter((preset) => preset.name !== name);
     persistPresets();
     refreshPresetOptions("");
-    status.textContent = `已删除条件：${name}`;
   }
 
   // —— 地图点击区域的个体信息 ——
@@ -840,12 +907,7 @@
       : "";
     return {
       text: `${symbol} ${individual.score.toFixed(1)}${weight}`,
-      genderClass:
-        individual.gender === MALE
-          ? "cotw-male"
-          : individual.gender === FEMALE
-            ? "cotw-female"
-            : "",
+      genderClass: genderClass(individual.gender),
     };
   }
 
@@ -887,6 +949,193 @@
         caret.classList.toggle("nav-caret-down", expanded);
       });
     }
+  }
+
+  // —— 已选个体列表 ——
+  // 列表是被勾选兽群内全部个体的暂存区：筛选只往里追加，只有「清空列表」才移除行。
+  // 行与兽群勾选框双向同步：取消到一只不剩就取消兽群，手动勾选兽群就补齐该群个体。
+
+  let selectedRows = []; // [{cb, index, name, gender, score, weight, checked}]
+  let sortKey = "score";
+  let sortDesc = true;
+  let suppressTreeSync = 0; // 列表写回树时，抑制「树 → 列表」回灌
+
+  const findRow = (cb, index) =>
+    selectedRows.find((row) => row.cb === cb && row.index === index);
+
+  // 行上标记所属兽群，便于和树上的行对应
+  const groupKeyOf = (cb) =>
+    `${cb.dataset.spawnAreaId ?? ""}/${cb.dataset.groupIndex ?? ""}`;
+
+  // 把某兽群中通过 test 的个体补进列表；recheck 为真时把已存在的行重新勾上
+  function appendGroupIndividuals(group, test, recheck = false) {
+    const individuals = group.individuals;
+    if (!individuals?.length) return 0;
+    let added = 0;
+    individuals.forEach((individual, index) => {
+      const row = findRow(group.cb, index);
+      if (row) {
+        if (recheck && test(individual) && !row.checked) row.checked = true;
+        return;
+      }
+      if (!test(individual)) return;
+      selectedRows.push({
+        cb: group.cb,
+        index,
+        name: group.name,
+        gender: individual.gender,
+        score: individual.score,
+        weight: individual.weight,
+        checked: true,
+      });
+      added += 1;
+    });
+    return added;
+  }
+
+  // 只在列表 → 树方向使用：避开 setChecked 触发的 change 事件又回灌列表
+  function setCheckedQuiet(cb, want) {
+    suppressTreeSync += 1;
+    try {
+      setChecked(cb, want);
+    } finally {
+      suppressTreeSync -= 1;
+    }
+  }
+
+  const sortValue = (row, key) => (key === "score" ? row.score : row.weight);
+
+  // 主排序键之外再用另一个维度兜底；非有限值始终排在最后
+  function compareRows(a, b) {
+    for (const key of [sortKey, sortKey === "score" ? "weight" : "score"]) {
+      const av = sortValue(a, key);
+      const bv = sortValue(b, key);
+      const am = !Number.isFinite(av);
+      const bm = !Number.isFinite(bv);
+      if (am !== bm) return am ? 1 : -1;
+      if (am && bm) continue;
+      if (av !== bv) return sortDesc ? bv - av : av - bv;
+    }
+    return a.name.localeCompare(b.name);
+  }
+
+  function renderSelectedRow(row) {
+    const label = document.createElement("label");
+    label.className = "cotw-sel-row";
+    label.dataset.group = groupKeyOf(row.cb);
+
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = row.checked;
+    box.addEventListener("change", () => toggleRow(row, box.checked));
+
+    const name = document.createElement("span");
+    name.className = `cotw-sel-name ${genderClass(row.gender)}`.trim();
+    name.textContent = `${row.name} ${GENDER_SYMBOL[row.gender] ?? "?"}`;
+    name.title = name.textContent;
+
+    const score = document.createElement("span");
+    score.className = "cotw-sel-score";
+    score.textContent = row.score.toFixed(1);
+
+    const weight = document.createElement("span");
+    weight.className = "cotw-sel-weight";
+    weight.textContent = Number.isFinite(row.weight)
+      ? `${row.weight.toFixed(1)}kg`
+      : "—";
+
+    label.append(box, name, score, weight);
+    return label;
+  }
+
+  function renderSelectedList() {
+    const checked = selectedRows.filter((row) => row.checked).length;
+    const parts = [];
+    if (selectedRows.length)
+      parts.push(`已选 ${checked} / ${selectedRows.length} 只`);
+    if (selectedSaveHandle) parts.push(selectedSaveHandle.name);
+    headerInfo.textContent = parts.join(" ｜ ");
+    selectedEmpty.hidden = selectedRows.length > 0;
+    selectedList.replaceChildren(
+      ...[...selectedRows].sort(compareRows).map(renderSelectedRow),
+    );
+
+    btnSortScore.textContent = `分数${sortKey === "score" && !sortDesc ? "↑" : "↓"}`;
+    btnSortWeight.textContent = `体重${sortKey === "weight" && !sortDesc ? "↑" : "↓"}`;
+    btnSortScore.classList.toggle("cotw-sort-active", sortKey === "score");
+    btnSortWeight.classList.toggle("cotw-sort-active", sortKey === "weight");
+
+    btnSelectAll.disabled =
+      operationInFlight || !selectedRows.some((row) => !row.checked);
+    btnSelectNone.disabled =
+      operationInFlight || !selectedRows.some((row) => row.checked);
+    btnSortScore.disabled = operationInFlight;
+    btnSortWeight.disabled = operationInFlight;
+  }
+
+  // 列表里取消个体：群内还有别的被勾个体就保持兽群勾选，一只不剩才取消
+  function toggleRow(row, checked) {
+    row.checked = checked;
+    setCheckedQuiet(
+      row.cb,
+      selectedRows.some((item) => item.cb === row.cb && item.checked),
+    );
+    renderSelectedList();
+  }
+
+  // 树 → 列表：手动勾选兽群不写入新行（列表只由「筛选并加入列表」写入），
+  // 但会把列表里已有的该群个体重新勾上；手动取消则把该群的行取消勾选
+  function syncRowsFromGroup(cb) {
+    const rows = selectedRows.filter((row) => row.cb === cb);
+    if (cb.checked) {
+      if (!rows.some((row) => !row.checked)) return;
+      rows.forEach((row) => {
+        row.checked = true;
+      });
+    } else {
+      if (!rows.some((row) => row.checked)) return;
+      rows.forEach((row) => {
+        row.checked = false;
+      });
+    }
+    renderSelectedList();
+  }
+
+  function onTreeCheckboxChanged(event) {
+    if (suppressTreeSync) return;
+    const cb = event.target;
+    if (!cb?.matches?.("input.nav-visible")) return;
+    syncRowsFromGroup(cb);
+  }
+
+  // 只作用于列表里已有的行，并同步回树
+  function setAllRowsChecked(checked) {
+    if (!selectedRows.length) return;
+    selectedRows.forEach((row) => {
+      row.checked = checked;
+    });
+    const groups = new Set(selectedRows.map((row) => row.cb));
+    suppressTreeSync += 1;
+    try {
+      groups.forEach((cb) => setChecked(cb, checked));
+    } finally {
+      suppressTreeSync -= 1;
+    }
+    renderSelectedList();
+  }
+
+  function setSortKey(key) {
+    if (sortKey === key) sortDesc = !sortDesc;
+    else {
+      sortKey = key;
+      sortDesc = true;
+    }
+    renderSelectedList();
+  }
+
+  function clearSelectedRows() {
+    selectedRows = [];
+    renderSelectedList();
   }
 
   let rebuildToken = 0;
@@ -954,65 +1203,27 @@
     updatePreview();
   }
 
-  // —— 统计 ——
+  // —— 提示 ——
+  // 底部提示只在需要用户注意时出现，正常流程不占用界面
 
-  function summarize(
-    groups = groupCache.filter((g) => g.name === selSpecies.value),
-    filter = makeFilter(),
-  ) {
-    let passing = 0;
-    let hits = 0;
-    let preciseGroups = 0;
-    let fallbackGroups = 0;
-    let unjudgedGroups = 0;
-
-    for (const group of groups) {
-      if (group.individuals?.length) {
-        preciseGroups += 1;
-        const matched = group.individuals.filter(filter.test).length;
-        if (matched > 0) {
-          passing += 1;
-          hits += matched;
-        }
-        continue;
-      }
-
-      // 缺个体数据：只用分数条件时能按地图上的最高分回退，用了体重/性别就只能放弃判断
-      fallbackGroups += 1;
-      if (filter.needsIndividuals) unjudgedGroups += 1;
-      else if (filter.testFallback(parseScore(group.cb))) passing += 1;
-    }
-    return {
-      total: groups.length,
-      passing,
-      hits,
-      preciseGroups,
-      fallbackGroups,
-      unjudgedGroups,
-    };
-  }
-
-  function summaryText({
-    total,
-    passing,
-    hits,
-    preciseGroups,
-    fallbackGroups,
-    unjudgedGroups,
-  }) {
-    const prefix = `${total} 群 · 达标 ${passing} 群`;
-    const unjudged = unjudgedGroups ? ` · 无法判断 ${unjudgedGroups} 群` : "";
-    if (fallbackGroups === 0) return `${prefix} · 命中 ${hits} 只`;
-    if (preciseGroups === 0) return `${prefix}${unjudged || " · 按最高分"}`;
-    return `${prefix} · 个体分数 ${preciseGroups} 群 · 最高分回退 ${fallbackGroups} 群 · 精确命中 ${hits} 只${unjudged}`;
+  // 缺个体数据又启用了体重/性别条件的兽群无法判断，不会被勾选
+  function unjudgedCount(groups) {
+    if (!makeFilter().needsIndividuals) return 0;
+    return groups.filter((group) => !group.individuals?.length).length;
   }
 
   function updatePreview() {
-    if (!selSpecies.value) {
+    const species = selSpecies.value;
+    if (!species) {
       status.textContent = "";
       return;
     }
-    status.textContent = summaryText(summarize());
+    const unjudged = unjudgedCount(
+      groupCache.filter((group) => group.name === species),
+    );
+    status.textContent = unjudged
+      ? `有 ${unjudged} 群缺少个体数据，无法判断是否命中，不会勾选`
+      : "";
   }
 
   // —— 主操作 ——
@@ -1028,11 +1239,9 @@
     }
 
     const filter = makeFilter();
-    const summary = summarize(groups, filter);
     operationInFlight = true;
     updateActionControls();
 
-    let added = 0;
     try {
       const completed = await runBatches(groups, (group, index) => {
         if (groupCache !== sourceCache || !group.cb.isConnected) return false;
@@ -1040,13 +1249,13 @@
           ? group.individuals.some(filter.test)
           : !filter.needsIndividuals &&
             filter.testFallback(parseScore(group.cb));
-        // 只追加勾选，不取消任何已有勾选
-        if (want && !group.cb.checked) {
-          setChecked(group.cb, true);
-          added += 1;
+        // 只追加：不取消已有勾选，也不覆盖列表里手动取消过的行
+        if (want) {
+          if (!group.cb.checked) setCheckedQuiet(group.cb, true);
+          appendGroupIndividuals(group, filter.test);
         }
         if (index % 16 === 0)
-          status.textContent = `筛选中 ${index}/${groups.length}`;
+          headerInfo.textContent = `筛选中 ${index}/${groups.length}`;
       });
       if (!completed) {
         status.textContent = "种群列表已更新，请重新筛选";
@@ -1064,7 +1273,7 @@
         $$("ul.nested", popRow).forEach((list) => list.classList.add("active"));
       }
 
-      status.textContent = `${summaryText(summary)} · 新增勾选 ${added} 群`;
+      renderSelectedList();
     } catch (error) {
       status.textContent = "筛选失败";
       console.error("[COTW 种群分数筛选] 应用筛选失败", error);
@@ -1076,8 +1285,14 @@
 
   function clearAll() {
     if (operationInFlight) return;
-    $$("#pop_nav input.nav-visible").forEach((cb) => setChecked(cb, false));
-    status.textContent = "已清空";
+    suppressTreeSync += 1;
+    try {
+      $$("#pop_nav input.nav-visible").forEach((cb) => setChecked(cb, false));
+    } finally {
+      suppressTreeSync -= 1;
+    }
+    selectedRows = [];
+    renderSelectedList();
   }
 
   // —— 单个存档文件选择与手动刷新 ——
@@ -1090,8 +1305,6 @@
   const ADF_ENVELOPE = [0x01, 0x01, 0x00, 0x00, 0x00, 0x20, 0x46, 0x44, 0x41];
   const ADF_MAGIC = [0x20, 0x46, 0x44, 0x41]; // " FDA"
 
-  let selectedSaveHandle = null;
-  let operationInFlight = false;
   let saveSelectionVersion = 0;
 
   function openSaveHandleDatabase() {
@@ -1169,6 +1382,7 @@
     selPreset.disabled = operationInFlight || presets.length === 0;
     btnSavePreset.disabled = operationInFlight;
     btnDeletePreset.disabled = operationInFlight || !selPreset.value;
+    renderSelectedList();
   }
 
   function pageSaveMapping() {
@@ -1271,7 +1485,6 @@
       selectedSaveHandle = handle;
       saveSelectionVersion += 1;
       updateSelectedSaveControls();
-      status.textContent = `已选择：${handle.name}`;
       try {
         await writeSavedHandle(handle);
       } catch (error) {
@@ -1313,7 +1526,6 @@
       }
 
       parseAndApplySave(file.name, bytes);
-      status.textContent = `已刷新：${file.name}`;
     } catch (error) {
       status.textContent = "刷新失败";
       console.error("[COTW 种群分数筛选] 手动刷新存档失败", error);
@@ -1336,7 +1548,6 @@
         return;
       selectedSaveHandle = handle;
       updateSelectedSaveControls();
-      status.textContent = `已选择：${handle.name}`;
     } catch (error) {
       console.warn("[COTW 种群分数筛选] 无法恢复存档选择", error);
     }
@@ -1426,10 +1637,13 @@
       processedInputs = inputs;
       processedSignatures = signatures;
 
+      const hadRows = selectedRows.length > 0;
       if (!(await rebuildIndex(inputs))) return;
       refreshSpecies();
       updatePreview();
       renderSelectedArea();
+      // 树重建（刷新存档 / 切换保护区）后个体数据已变，列表作废
+      if (hadRows) clearSelectedRows();
     } catch (error) {
       processedTree = null;
       processedVersion = -1;
@@ -1495,11 +1709,19 @@
       childList: true,
       subtree: true,
     });
+    // 手动点击树上的兽群勾选框时，同步到列表
+    dropzone.addEventListener("change", onTreeCheckboxChanged);
   }
+
+  btnSelectAll.addEventListener("click", () => setAllRowsChecked(true));
+  btnSelectNone.addEventListener("click", () => setAllRowsChecked(false));
+  btnSortScore.addEventListener("click", () => setSortKey("score"));
+  btnSortWeight.addEventListener("click", () => setSortKey("weight"));
 
   // 恢复上次保存的筛选条件预设
   presets = loadPresets();
   refreshPresetOptions();
+  renderSelectedList();
 
   hookSaveParser();
   void onTreeChanged();
