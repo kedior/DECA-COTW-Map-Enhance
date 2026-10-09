@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      2.0.1
+// @version      2.0.2
 // @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数、已选个体列表、筛选条件预设与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
@@ -14,13 +14,14 @@
   // —— 基础工具 ——
 
   // 轻量响应式 Store：只观察顶层状态，复杂缓存和 DOM 引用留在运行时模型中。
-  // 这样状态更新可以驱动对应视图，同时不会递归代理 DECA 的 DOM 或 Map。
+  // 常规状态更新驱动视图；正在编辑的文本可静默同步，避免重绘打断输入法。
   function createStore(initialState, onChange) {
     const changedKeys = new Set();
     let batchDepth = 0;
+    let silentDepth = 0;
 
     const flush = () => {
-      if (batchDepth || changedKeys.size === 0) return;
+      if (batchDepth || silentDepth || changedKeys.size === 0) return;
       const keys = [...changedKeys];
       changedKeys.clear();
       onChange(state, keys);
@@ -48,6 +49,16 @@
         } finally {
           batchDepth -= 1;
           flush();
+        }
+      },
+      // 文本输入由浏览器直接更新当前控件；静默同步 Store 可避免打断 IME 和光标。
+      silent(callback) {
+        silentDepth += 1;
+        try {
+          return callback(state);
+        } finally {
+          silentDepth -= 1;
+          if (silentDepth === 0 && batchDepth === 0) changedKeys.clear();
         }
       },
     };
@@ -502,10 +513,24 @@
     if (
       !/^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:e[+-]?\d+)?$/i.test(normalized)
     )
-      return null;
+      return NaN;
     const number = Number(normalized);
-    return Number.isFinite(number) ? number : null;
+    return Number.isFinite(number) ? number : NaN;
   };
+
+  function invalidFilterBoundLabel() {
+    const labels = [
+      ["scoreMin", "最小分数"],
+      ["scoreMax", "最大分数"],
+      ["weightMin", "最小体重"],
+      ["weightMax", "最大体重"],
+    ];
+    for (const [key, label] of labels) {
+      const rawValue = String(state.filters[key] ?? "").trim();
+      if (rawValue && !Number.isFinite(readBound(rawValue))) return label;
+    }
+    return null;
+  }
 
   // 边界包含在范围内；两侧都留空表示该维度不限制
   const inRange = (value, min, max) => {
@@ -654,6 +679,11 @@
 
   function confirmPresetSave() {
     const name = state.presetName.trim();
+    const invalidBound = invalidFilterBoundLabel();
+    if (invalidBound) {
+      state.presetError = `${invalidBound}必须是有效数字`;
+      return;
+    }
     if (!name) {
       state.presetError = "请输入条件名称";
       return;
@@ -1171,6 +1201,12 @@
 
   async function applyFilter() {
     if (state.busy) return;
+    const invalidBound = invalidFilterBoundLabel();
+    if (invalidBound) {
+      state.statusText = `${invalidBound}必须是有效数字`;
+      return;
+    }
+    updatePreview();
     const sourceCache = groupCache;
     const species = state.selectedSpecies;
     const groups = sourceCache.filter((group) => group.name === species);
@@ -1497,13 +1533,19 @@
     const input = event.target;
     if (input.matches?.("[data-filter]")) {
       const key = input.dataset.filter;
-      store.batch((nextState) => {
+      const hadPresetSelection = Boolean(state.presetSelection);
+      store.silent((nextState) => {
         nextState.filters = { ...state.filters, [key]: input.value };
         nextState.presetSelection = "";
-        updatePreview();
       });
+      if (hadPresetSelection) {
+        const presetSelect = panel.querySelector("#cotw-preset");
+        if (presetSelect) presetSelect.value = "";
+      }
     } else if (input.matches?.("[data-preset-name]")) {
-      state.presetName = input.value;
+      store.silent((nextState) => {
+        nextState.presetName = input.value;
+      });
     }
   }
 
@@ -1545,6 +1587,7 @@
 
   function handlePanelKeydown(event) {
     if (!event.target.matches?.("[data-preset-name]")) return;
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
       event.preventDefault();
       confirmPresetSave();
