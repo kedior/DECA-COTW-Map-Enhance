@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      2.0.0
+// @version      2.0.1
 // @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数、已选个体列表、筛选条件预设与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
@@ -495,8 +495,16 @@
 
   // 留空边界解析为 null，否则按数值处理。
   const readBound = (value) => {
-    const normalized = String(value ?? "").trim();
-    return normalized === "" ? null : parseFloat(normalized);
+    const normalized = String(value ?? "")
+      .trim()
+      .replace(",", ".");
+    if (!normalized) return null;
+    if (
+      !/^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:e[+-]?\d+)?$/i.test(normalized)
+    )
+      return null;
+    const number = Number(normalized);
+    return Number.isFinite(number) ? number : null;
   };
 
   // 边界包含在范围内；两侧都留空表示该维度不限制
@@ -1813,12 +1821,12 @@
           <button id="cotw-preset-delete" class="cotw-secondary" data-action="delete-preset" ${disabled || !currentState.presetSelection ? "disabled" : ""}>删除</button>
         </div>
         <div class="cotw-range">
-          <div><label>最小分数</label><input id="cotw-min" data-filter="scoreMin" data-focus-key="score-min" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.scoreMin)}" ${disabled}></div>
-          <div><label>最大分数</label><input id="cotw-max" data-filter="scoreMax" data-focus-key="score-max" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.scoreMax)}" ${disabled}></div>
+          <div><label>最小分数</label><input id="cotw-min" data-filter="scoreMin" data-focus-key="score-min" type="text" inputmode="decimal" autocomplete="off" placeholder="不限" value="${escapeHtml(currentState.filters.scoreMin)}" ${disabled}></div>
+          <div><label>最大分数</label><input id="cotw-max" data-filter="scoreMax" data-focus-key="score-max" type="text" inputmode="decimal" autocomplete="off" placeholder="不限" value="${escapeHtml(currentState.filters.scoreMax)}" ${disabled}></div>
         </div>
         <div class="cotw-range">
-          <div><label>最小体重</label><input id="cotw-weight-min" data-filter="weightMin" data-focus-key="weight-min" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.weightMin)}" ${disabled}></div>
-          <div><label>最大体重</label><input id="cotw-weight-max" data-filter="weightMax" data-focus-key="weight-max" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.weightMax)}" ${disabled}></div>
+          <div><label>最小体重</label><input id="cotw-weight-min" data-filter="weightMin" data-focus-key="weight-min" type="text" inputmode="decimal" autocomplete="off" placeholder="不限" value="${escapeHtml(currentState.filters.weightMin)}" ${disabled}></div>
+          <div><label>最大体重</label><input id="cotw-weight-max" data-filter="weightMax" data-focus-key="weight-max" type="text" inputmode="decimal" autocomplete="off" placeholder="不限" value="${escapeHtml(currentState.filters.weightMax)}" ${disabled}></div>
         </div>
         <label>性别</label>
         <div class="cotw-genders">
@@ -1865,7 +1873,6 @@
     const focusId = panel.contains(activeElement) ? activeElement.id : "";
     const selection =
       activeElement instanceof HTMLInputElement &&
-      activeElement.type !== "number" &&
       typeof activeElement.selectionStart === "number"
         ? [activeElement.selectionStart, activeElement.selectionEnd]
         : null;
