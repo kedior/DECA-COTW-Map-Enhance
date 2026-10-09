@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DECA COTW 地图 · 种群分数筛选
 // @namespace    cotw-kedior
-// @version      1.7.0
+// @version      2.0.0
 // @description  按物种、分数、体重、性别筛选动物兽群，支持个体分数、已选个体列表、筛选条件预设与手动刷新存档
 // @match        https://mathartbang.com/deca/hp/map.html*
 // @grant        none
@@ -13,9 +13,45 @@
 
   // —— 基础工具 ——
 
-  const $ = (sel, root = document) => root.querySelector(sel);
-  const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
-  const yieldToUI = () => new Promise((resolve) => setTimeout(resolve, 0));
+  // 轻量响应式 Store：只观察顶层状态，复杂缓存和 DOM 引用留在运行时模型中。
+  // 这样状态更新可以驱动对应视图，同时不会递归代理 DECA 的 DOM 或 Map。
+  function createStore(initialState, onChange) {
+    const changedKeys = new Set();
+    let batchDepth = 0;
+
+    const flush = () => {
+      if (batchDepth || changedKeys.size === 0) return;
+      const keys = [...changedKeys];
+      changedKeys.clear();
+      onChange(state, keys);
+    };
+
+    const state = new Proxy(
+      { ...initialState },
+      {
+        set(target, key, value) {
+          if (Object.is(target[key], value)) return true;
+          target[key] = value;
+          changedKeys.add(key);
+          flush();
+          return true;
+        },
+      },
+    );
+
+    return {
+      state,
+      batch(callback) {
+        batchDepth += 1;
+        try {
+          return callback(state);
+        } finally {
+          batchDepth -= 1;
+          flush();
+        }
+      },
+    };
+  }
 
   // 控制台输出统一带前缀，方便筛出本脚本的日志
   const LOG_PREFIX = "[COTW 种群分数筛选]";
@@ -24,7 +60,7 @@
   const logError = (message, error) =>
     console.error(`${LOG_PREFIX} ${message}`, error);
 
-  // 建元素样板：标签 + 类名 + 文本。渲染函数里反复出现，抽出来避免淹没逻辑
+  // 仅用于增强 DECA 原有种群树；本脚本面板由 AppView(state) 模板统一渲染。
   function el(tag, className = "", text = "") {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -32,18 +68,15 @@
     return node;
   }
 
-  // 主操作（筛选 / 清空 / 存档读取）进行中，期间禁用按钮
-  let operationInFlight = false;
-  // 当前选中的存档文件句柄，顶部要显示它对应的存档名
+  // 页面索引、DECA DOM 引用和文件句柄属于运行时模型，不放入 UI Store。
   let selectedSaveHandle = null;
-
   // 分片执行：按时间预算让出主线程，避免长任务卡住页面
   async function runBatches(items, worker, budgetMs = 8) {
     let t0 = performance.now();
     for (let i = 0; i < items.length; ++i) {
       if (worker(items[i], i) === false) return false;
       if (performance.now() - t0 > budgetMs) {
-        await yieldToUI();
+        await new Promise((resolve) => setTimeout(resolve, 0));
         t0 = performance.now();
       }
     }
@@ -77,8 +110,10 @@
   };
 
   const populationRows = () =>
-    $$(
-      `#pop_nav input.nav-visible[data-population-id]:not([data-spawn-area-id])`,
+    Array.from(
+      document.querySelectorAll(
+        `#pop_nav input.nav-visible[data-population-id]:not([data-spawn-area-id])`,
+      ),
     );
 
   // 走页面自身的 click 事件，与手动点击等价
@@ -292,7 +327,7 @@
     const pid = cb.dataset.populationId;
     if (popNameCache.has(pid)) return popNameCache.get(pid);
 
-    const row = $(
+    const row = document.querySelector(
       `#pop_nav input.nav-visible[data-population-id="${pid}"]:not([data-spawn-area-id])`,
     );
     const name = row ? populationName(row) : null;
@@ -307,8 +342,7 @@
 
   // —— 面板 ——
 
-  const style = document.createElement("style");
-  style.textContent = `
+  const PANEL_CSS = `
         #cotw-filter-panel {
             position: fixed; top: 12px; right: 12px; z-index: 10000;
             display: flex; flex-direction: column; max-height: calc(100vh - 24px);
@@ -433,107 +467,22 @@
         .cotw-area-score.cotw-female { color: #e26a9a; }
         #pop_nav .cotw-caret { cursor: pointer; }
     `;
-  document.head.appendChild(style);
 
-  const panel = document.createElement("div");
-  panel.id = "cotw-filter-panel";
-  panel.innerHTML = `
-        <div id="cotw-filter-header"><span>🦌 种群筛选</span><span id="cotw-header-info"></span><span id="cotw-filter-toggle">−</span></div>
-        <div id="cotw-panel-columns">
-            <div id="cotw-selected-panel">
-                <div class="cotw-selected-toolbar">
-                    <button id="cotw-select-all">全选</button>
-                    <button id="cotw-select-none">全不选</button>
-                    <span class="cotw-selected-sort">
-                        <button id="cotw-sort-score">分数↓</button>
-                        <button id="cotw-sort-weight">体重↓</button>
-                    </span>
-                </div>
-                <div id="cotw-selected-list"></div>
-                <div id="cotw-selected-empty">还没有加入的个体</div>
-            </div>
-            <div id="cotw-filter-body">
-                <button id="cotw-select-save" class="cotw-secondary">选择存档文件</button>
-                <div id="cotw-selected-save-actions" hidden>
-                    <button id="cotw-reselect-save" class="cotw-secondary">重新选择存档</button>
-                    <button id="cotw-refresh-save">刷新存档</button>
-                </div>
-                <label>物种</label>
-                <select id="cotw-species"></select>
-                <label>筛选条件</label>
-                <div class="cotw-preset-row">
-                    <select id="cotw-preset"></select>
-                    <button id="cotw-preset-save" class="cotw-secondary">保存</button>
-                    <button id="cotw-preset-delete" class="cotw-secondary">删除</button>
-                </div>
-                <div class="cotw-range">
-                    <div><label>最小分数</label><input id="cotw-min" type="number" step="0.1" placeholder="不限"></div>
-                    <div><label>最大分数</label><input id="cotw-max" type="number" step="0.1" placeholder="不限"></div>
-                </div>
-                <div class="cotw-range">
-                    <div><label>最小体重</label><input id="cotw-weight-min" type="number" step="0.1" placeholder="不限"></div>
-                    <div><label>最大体重</label><input id="cotw-weight-max" type="number" step="0.1" placeholder="不限"></div>
-                </div>
-                <label>性别</label>
-                <div class="cotw-genders">
-                    <label><input id="cotw-gender-male" type="checkbox" checked> 公 ♂</label>
-                    <label><input id="cotw-gender-female" type="checkbox" checked> 母 ♀</label>
-                </div>
-                <button id="cotw-apply">筛选并加入列表</button>
-                <button id="cotw-clear" class="cotw-secondary">清空列表</button>
-                <div id="cotw-status"></div>
-                <div id="cotw-area-info" hidden>
-                    <div id="cotw-area-results"></div>
-                </div>
-                <div id="cotw-preset-dialog" class="cotw-preset-dialog" hidden>
-                    <div class="cotw-dialog-card">
-                        <div class="cotw-dialog-title">保存筛选条件</div>
-                        <input id="cotw-preset-name" type="text" maxlength="20" placeholder="条件名称">
-                        <div id="cotw-preset-error" class="cotw-dialog-error"></div>
-                        <div class="cotw-dialog-actions">
-                            <button id="cotw-preset-cancel" class="cotw-secondary">取消</button>
-                            <button id="cotw-preset-confirm">保存</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `;
-  document.body.appendChild(panel);
+  let panel;
+  let store;
+  let state;
 
-  const header = $("#cotw-filter-header", panel);
-  const toggle = $("#cotw-filter-toggle", panel);
-  const headerInfo = $("#cotw-header-info", panel);
-  const selectedList = $("#cotw-selected-list", panel);
-  const selectedEmpty = $("#cotw-selected-empty", panel);
-  const btnSelectAll = $("#cotw-select-all", panel);
-  const btnSelectNone = $("#cotw-select-none", panel);
-  const btnSortScore = $("#cotw-sort-score", panel);
-  const btnSortWeight = $("#cotw-sort-weight", panel);
-  const selSpecies = $("#cotw-species", panel);
-  const selPreset = $("#cotw-preset", panel);
-  const btnSavePreset = $("#cotw-preset-save", panel);
-  const btnDeletePreset = $("#cotw-preset-delete", panel);
-  const presetDialog = $("#cotw-preset-dialog", panel);
-  const inpPresetName = $("#cotw-preset-name", panel);
-  const presetError = $("#cotw-preset-error", panel);
-  const btnPresetCancel = $("#cotw-preset-cancel", panel);
-  const btnPresetConfirm = $("#cotw-preset-confirm", panel);
-  const inpMin = $("#cotw-min", panel);
-  const inpMax = $("#cotw-max", panel);
-  const inpWeightMin = $("#cotw-weight-min", panel);
-  const inpWeightMax = $("#cotw-weight-max", panel);
-  const chkMale = $("#cotw-gender-male", panel);
-  const chkFemale = $("#cotw-gender-female", panel);
-  const btnApply = $("#cotw-apply", panel);
-  const btnClear = $("#cotw-clear", panel);
-  const btnSelectSave = $("#cotw-select-save", panel);
-  const selectedSaveActions = $("#cotw-selected-save-actions", panel);
-  const btnReselectSave = $("#cotw-reselect-save", panel);
-  const btnRefreshSave = $("#cotw-refresh-save", panel);
-  const status = $("#cotw-status", panel);
-  const areaInfo = $("#cotw-area-info", panel);
-  const areaResults = $("#cotw-area-results", panel);
+  const escapeHtml = (value) =>
+    String(value ?? "").replace(/[&<>"']/g, (character) => {
+      const entities = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+      return entities[character];
+    });
 
   // —— 拖拽 / 折叠 ——
 
@@ -542,58 +491,12 @@
 
   let drag = null;
 
-  header.addEventListener("pointerdown", (e) => {
-    if (e.pointerType === "mouse" && e.button !== 0) return;
-    const rect = panel.getBoundingClientRect();
-    drag = {
-      dx: e.clientX - rect.left,
-      dy: e.clientY - rect.top,
-      x0: e.clientX,
-      y0: e.clientY,
-      w: rect.width,
-      moved: false,
-    };
-    header.setPointerCapture(e.pointerId);
-  });
-
-  header.addEventListener("pointermove", (e) => {
-    if (!drag) return;
-    if (
-      !drag.moved &&
-      Math.abs(e.clientX - drag.x0) + Math.abs(e.clientY - drag.y0) <
-        DRAG_THRESHOLD_PX
-    )
-      return;
-    drag.moved = true;
-
-    const left = Math.min(
-      Math.max(0, e.clientX - drag.dx),
-      window.innerWidth - drag.w,
-    );
-    const top = Math.min(
-      Math.max(0, e.clientY - drag.dy),
-      window.innerHeight - DRAG_MIN_VISIBLE_PX,
-    );
-    panel.style.left = left + "px";
-    panel.style.top = top + "px";
-    panel.style.right = "auto";
-  });
-
-  header.addEventListener("pointerup", (e) => {
-    if (drag && !drag.moved) {
-      panel.classList.toggle("collapsed");
-      toggle.textContent = panel.classList.contains("collapsed") ? "+" : "−";
-    }
-    drag = null;
-    header.releasePointerCapture(e.pointerId);
-  });
-
   // —— 筛选条件 ——
 
-  // 读取边界输入框：留空表示该侧不限（null），否则取数值
-  const readBound = (inp) => {
-    const value = inp.value.trim();
-    return value === "" ? null : parseFloat(value);
+  // 留空边界解析为 null，否则按数值处理。
+  const readBound = (value) => {
+    const normalized = String(value ?? "").trim();
+    return normalized === "" ? null : parseFloat(normalized);
   };
 
   // 边界包含在范围内；两侧都留空表示该维度不限制
@@ -610,13 +513,21 @@
   // 体重和性别只存在于个体数据里，地图行文本只有 Max Score，
   // 所以缺个体数据的兽群在这些条件生效时不能回退猜测。
   function makeFilter() {
-    const scoreMin = readBound(inpMin);
-    const scoreMax = readBound(inpMax);
-    const weightMin = readBound(inpWeightMin);
-    const weightMax = readBound(inpWeightMax);
+    const {
+      scoreMin: rawScoreMin,
+      scoreMax: rawScoreMax,
+      weightMin: rawWeightMin,
+      weightMax: rawWeightMax,
+      male,
+      female,
+    } = state.filters;
+    const scoreMin = readBound(rawScoreMin);
+    const scoreMax = readBound(rawScoreMax);
+    const weightMin = readBound(rawWeightMin);
+    const weightMax = readBound(rawWeightMax);
     const genders = new Set();
-    if (chkMale.checked) genders.add(MALE);
-    if (chkFemale.checked) genders.add(FEMALE);
+    if (male) genders.add(MALE);
+    if (female) genders.add(FEMALE);
     // 两个都勾或都不勾都表示不限性别
     const onlyGenders = genders.size === 1 ? genders : null;
     const hasWeightRange = weightMin !== null || weightMax !== null;
@@ -636,7 +547,6 @@
   // 只存四个数值框和性别，物种不进预设；套用预设只替换数值，不触发勾选。
 
   const PRESET_STORAGE_KEY = "cotw-filter-presets";
-  let presets = [];
 
   const finiteOrNull = (value) =>
     typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -671,7 +581,7 @@
 
   function persistPresets() {
     try {
-      localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets));
+      localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(state.presets));
     } catch (error) {
       logWarn("无法保存筛选条件", error);
     }
@@ -680,90 +590,84 @@
   // 当前面板上的四项条件，不含物种
   function currentConditions() {
     return {
-      scoreMin: finiteOrNull(readBound(inpMin)),
-      scoreMax: finiteOrNull(readBound(inpMax)),
-      weightMin: finiteOrNull(readBound(inpWeightMin)),
-      weightMax: finiteOrNull(readBound(inpWeightMax)),
-      male: chkMale.checked,
-      female: chkFemale.checked,
+      scoreMin: finiteOrNull(readBound(state.filters.scoreMin)),
+      scoreMax: finiteOrNull(readBound(state.filters.scoreMax)),
+      weightMin: finiteOrNull(readBound(state.filters.weightMin)),
+      weightMax: finiteOrNull(readBound(state.filters.weightMax)),
+      male: state.filters.male,
+      female: state.filters.female,
     };
   }
 
-  const fillConditionInput = (inp, value) => {
-    inp.value = value === null || value === undefined ? "" : String(value);
-  };
+  function presetToFilters(preset) {
+    return {
+      scoreMin: preset.scoreMin === null ? "" : String(preset.scoreMin),
+      scoreMax: preset.scoreMax === null ? "" : String(preset.scoreMax),
+      weightMin: preset.weightMin === null ? "" : String(preset.weightMin),
+      weightMax: preset.weightMax === null ? "" : String(preset.weightMax),
+      male: preset.male,
+      female: preset.female,
+    };
+  }
 
-  // 只替换数值和性别，不勾选也不取消；状态栏跟着刷新预览
+  // 只替换筛选状态，不触碰勾选列表；视图由 Store 自动更新。
   function applyPreset(preset) {
-    fillConditionInput(inpMin, preset.scoreMin);
-    fillConditionInput(inpMax, preset.scoreMax);
-    fillConditionInput(inpWeightMin, preset.weightMin);
-    fillConditionInput(inpWeightMax, preset.weightMax);
-    chkMale.checked = preset.male;
-    chkFemale.checked = preset.female;
+    state.filters = presetToFilters(preset);
     updatePreview();
   }
 
   function refreshPresetOptions(selectName = null) {
-    const previous = selectName ?? selPreset.value;
-    const placeholder = el(
-      "option",
-      "",
-      presets.length ? "选择已保存条件" : "暂无保存的条件",
-    );
-    placeholder.value = ""; // 占位项必须是空值，否则会被当成一个预设名
-    selPreset.replaceChildren(
-      placeholder,
-      ...presets.map((preset) => el("option", "", preset.name)),
-    );
-    selPreset.value = presets.some((preset) => preset.name === previous)
+    const previous = selectName ?? state.presetSelection;
+    state.presetSelection = state.presets.some(
+      (preset) => preset.name === previous,
+    )
       ? previous
       : "";
-    updateActionControls();
-  }
-
-  // 手动改动任意条件后，下拉框退回默认项，避免显示与实际数值不符的预设名
-  function resetPresetSelection() {
-    if (!selPreset.value) return;
-    selPreset.value = "";
-    updateActionControls();
   }
 
   function openPresetDialog() {
-    if (operationInFlight) return;
-    inpPresetName.value = selPreset.value;
-    presetError.textContent = "";
-    presetDialog.hidden = false;
-    inpPresetName.focus();
-    inpPresetName.select();
+    if (state.busy) return;
+    store.batch((nextState) => {
+      nextState.presetName = state.presetSelection;
+      nextState.presetError = "";
+      nextState.presetDialogOpen = true;
+    });
+    const nameInput = panel.querySelector("#cotw-preset-name");
+    nameInput?.focus();
+    nameInput?.select();
   }
 
   function closePresetDialog() {
-    presetDialog.hidden = true;
-    presetError.textContent = "";
+    store.batch((nextState) => {
+      nextState.presetDialogOpen = false;
+      nextState.presetError = "";
+    });
   }
 
   function confirmPresetSave() {
-    const name = inpPresetName.value.trim();
+    const name = state.presetName.trim();
     if (!name) {
-      presetError.textContent = "请输入条件名称";
+      state.presetError = "请输入条件名称";
       return;
     }
-    if (presets.some((preset) => preset.name === name)) {
-      presetError.textContent = "已存在同名条件，请换一个名字";
+    if (state.presets.some((preset) => preset.name === name)) {
+      state.presetError = "已存在同名条件，请换一个名字";
       return;
     }
 
-    presets.push({ name, ...currentConditions() });
+    store.batch((nextState) => {
+      nextState.presets = [...state.presets, { name, ...currentConditions() }];
+      nextState.presetSelection = name;
+      nextState.presetDialogOpen = false;
+      nextState.presetError = "";
+    });
     persistPresets();
-    refreshPresetOptions(name);
-    closePresetDialog();
   }
 
   function deleteSelectedPreset() {
-    const name = selPreset.value;
+    const name = state.presetSelection;
     if (!name) return;
-    presets = presets.filter((preset) => preset.name !== name);
+    state.presets = state.presets.filter((preset) => preset.name !== name);
     persistPresets();
     refreshPresetOptions("");
   }
@@ -872,56 +776,68 @@
     return group?.cb.isConnected ? group : null;
   }
 
-  // 一个命中兽群的信息块：名称 / 区域 / 个体分数；缺个体数据时回退到地图最高分
-  function buildAreaGroupBlock(entry) {
-    const block = el("div", "cotw-area-group");
-    const group = findCachedGroup(entry);
+  // 区域命中项是纯视图组件，只依赖传入的可渲染数据。
+  function renderAreaGroupBlock(entry) {
     const name =
-      group?.name || entry.populationName || `物种 ${entry.populationId}`;
-    block.appendChild(
-      el("div", "cotw-area-name", `${name} · 群 ${entry.groupIndex}`),
-    );
-    block.appendChild(
-      el(
-        "div",
-        "cotw-area-meta",
-        [`出生区 ${entry.spawnAreaId}`, ...entry.areas].join(" · "),
-      ),
-    );
+      entry.name || entry.populationName || `物种 ${entry.populationId}`;
+    const metadata = [`出生区 ${entry.spawnAreaId}`, ...entry.areas]
+      .map(escapeHtml)
+      .join(" · ");
 
-    if (!group?.individuals?.length) {
-      let text = "个体数据不可用";
-      if (Number.isFinite(entry.maxScore))
-        text += ` · 地图最高分 ${entry.maxScore.toFixed(1)}`;
-      block.appendChild(el("div", "cotw-area-meta", text));
-      return block;
+    if (!entry.individuals.length) {
+      const fallback = Number.isFinite(entry.maxScore)
+        ? ` · 地图最高分 ${entry.maxScore.toFixed(1)}`
+        : "";
+      return `
+        <div class="cotw-area-group">
+          <div class="cotw-area-name">${escapeHtml(name)} · 群 ${escapeHtml(entry.groupIndex)}</div>
+          <div class="cotw-area-meta">${metadata}</div>
+          <div class="cotw-area-meta">个体数据不可用${fallback}</div>
+        </div>
+      `;
     }
 
-    block.appendChild(
-      el("div", "cotw-area-meta", `个体（${group.individuals.length} 只）`),
-    );
-    const chips = el("div", "cotw-area-scores");
-    for (const individual of group.individuals) {
-      const { text, className } = individualView(individual);
-      chips.appendChild(
-        el("span", `cotw-area-score ${className}`.trim(), text),
-      );
-    }
-    block.appendChild(chips);
-    return block;
+    const individuals = entry.individuals
+      .map((individual) => {
+        const { text, className } = individualView(individual);
+        return `<span class="cotw-area-score ${className}">${escapeHtml(text)}</span>`;
+      })
+      .join("");
+
+    return `
+      <div class="cotw-area-group">
+        <div class="cotw-area-name">${escapeHtml(name)} · 群 ${escapeHtml(entry.groupIndex)}</div>
+        <div class="cotw-area-meta">${metadata}</div>
+        <div class="cotw-area-meta">个体（${entry.individuals.length} 只）</div>
+        <div class="cotw-area-scores">${individuals}</div>
+      </div>
+    `;
   }
 
   function renderSelectedArea() {
-    areaResults.replaceChildren();
-    areaInfo.hidden = selectedAreaEntries.length === 0 && !areaEmptyText;
-    if (selectedAreaEntries.length === 0) {
-      if (areaEmptyText)
-        areaResults.appendChild(el("div", "cotw-area-empty", areaEmptyText));
-      return;
-    }
-    areaResults.replaceChildren(
-      ...selectedAreaEntries.map(buildAreaGroupBlock),
-    );
+    const entries = selectedAreaEntries.map((entry) => {
+      const group = findCachedGroup(entry);
+      return {
+        populationId: entry.populationId,
+        populationName: entry.populationName,
+        name: group?.name ?? "",
+        spawnAreaId: entry.spawnAreaId,
+        groupIndex: entry.groupIndex,
+        maxScore: entry.maxScore,
+        areas: [...entry.areas],
+        individuals:
+          group?.individuals?.map(({ score, weight, gender }) => ({
+            score,
+            weight,
+            gender,
+          })) ?? [],
+      };
+    });
+
+    store.batch((nextState) => {
+      nextState.areaEntries = entries;
+      nextState.areaEmptyText = areaEmptyText;
+    });
   }
 
   // —— 个体层渲染 ——
@@ -947,7 +863,7 @@
     if (caret.dataset.cotwScoresToggleBound) return;
     caret.dataset.cotwScoresToggleBound = "true";
     caret.addEventListener("click", () => {
-      const currentList = $(":scope > ul.cotw-animals", li);
+      const currentList = li.querySelector(":scope > ul.cotw-animals");
       if (!currentList) return;
       const expanded = currentList.classList.toggle("active");
       caret.classList.toggle("nav-caret-down", expanded);
@@ -955,8 +871,10 @@
   }
 
   function syncGroupIndividuals(li, individuals) {
-    let list = $(":scope > ul.cotw-animals", li);
-    const caret = $(":scope > .nav-spacer, :scope > .cotw-caret", li);
+    let list = li.querySelector(":scope > ul.cotw-animals");
+    const caret = li.querySelector(
+      ":scope > .nav-spacer, :scope > .cotw-caret",
+    );
 
     if (!individuals?.length) {
       list?.remove();
@@ -983,8 +901,6 @@
   // 行与兽群勾选框双向同步：取消到一只不剩就取消兽群；手动勾选兽群只回灌已有行，不新增行。
 
   let selectedRows = []; // [{cb, index, name, gender, score, weight, checked}]
-  let sortKey = "score";
-  let sortDesc = true;
   let suppressTreeSync = 0; // 列表写回树时，抑制「树 → 列表」回灌
 
   // 列表 → 树方向统一走这里，避免 setChecked 触发的 change 事件又回灌列表
@@ -1038,86 +954,39 @@
 
   // 主排序键之外再用另一个维度兜底；非有限值始终排在最后
   function compareRows(a, b) {
-    for (const key of [sortKey, sortKey === "score" ? "weight" : "score"]) {
+    for (const key of [
+      state.sortKey,
+      state.sortKey === "score" ? "weight" : "score",
+    ]) {
       const av = sortValue(a, key);
       const bv = sortValue(b, key);
       const am = !Number.isFinite(av);
       const bm = !Number.isFinite(bv);
       if (am !== bm) return am ? 1 : -1;
       if (am && bm) continue;
-      if (av !== bv) return sortDesc ? bv - av : av - bv;
+      if (av !== bv) return state.sortDescending ? bv - av : av - bv;
     }
     return a.name.localeCompare(b.name);
   }
 
-  function renderSelectedRow(row) {
-    const label = el("label", "cotw-sel-row");
-    label.dataset.group = groupKeyOf(row.cb);
-
-    const box = el("input");
-    box.type = "checkbox";
-    box.checked = row.checked;
-    box.addEventListener("change", () => toggleRow(row, box.checked));
-
-    const name = el(
-      "span",
-      `cotw-sel-name ${genderClass(row.gender)}`.trim(),
-      `${row.name} ${GENDER_SYMBOL[row.gender] ?? "?"}`,
-    );
-    name.title = name.textContent;
-
-    label.append(
-      box,
-      name,
-      el("span", "cotw-sel-score", row.score.toFixed(1)),
-      el(
-        "span",
-        "cotw-sel-weight",
-        Number.isFinite(row.weight) ? `${row.weight.toFixed(1)}kg` : "—",
-      ),
-    );
-    return label;
-  }
-
-  const checkedRowCount = () =>
-    selectedRows.filter((row) => row.checked).length;
-
-  // 顶部信息：已选计数 + 存档名；筛选进行中用 progress 临时顶替
+  // 顶部进度也属于视图状态，赋值后由 AppView 统一重绘。
   function updateHeaderInfo(progress = "") {
-    const parts = [];
-    if (progress) parts.push(progress);
-    else {
-      if (selectedRows.length)
-        parts.push(`已选 ${checkedRowCount()} / ${selectedRows.length} 只`);
-      if (selectedSaveHandle) parts.push(selectedSaveHandle.name);
-    }
-    headerInfo.textContent = parts.join(" ｜ ");
+    state.progress = progress;
   }
 
-  function renderSortButtons() {
-    btnSortScore.textContent = `分数${sortKey === "score" && !sortDesc ? "↑" : "↓"}`;
-    btnSortWeight.textContent = `体重${sortKey === "weight" && !sortDesc ? "↑" : "↓"}`;
-    btnSortScore.classList.toggle("cotw-sort-active", sortKey === "score");
-    btnSortWeight.classList.toggle("cotw-sort-active", sortKey === "weight");
-  }
-
-  function updateListButtons() {
-    btnSelectAll.disabled =
-      operationInFlight || !selectedRows.some((row) => !row.checked);
-    btnSelectNone.disabled =
-      operationInFlight || !selectedRows.some((row) => row.checked);
-    btnSortScore.disabled = operationInFlight;
-    btnSortWeight.disabled = operationInFlight;
-  }
-
+  // 将带树节点引用的运行时列表投影到视图状态，由 SelectedIndividualsView 渲染。
   function renderSelectedList() {
-    updateHeaderInfo();
-    selectedEmpty.hidden = selectedRows.length > 0;
-    selectedList.replaceChildren(
-      ...[...selectedRows].sort(compareRows).map(renderSelectedRow),
-    );
-    renderSortButtons();
-    updateListButtons();
+    store.batch((nextState) => {
+      nextState.selectedRows = selectedRows.map((row) => ({
+        groupKey: groupKeyOf(row.cb),
+        name: row.name,
+        gender: row.gender,
+        score: row.score,
+        weight: row.weight,
+        checked: row.checked,
+      }));
+      nextState.progress = "";
+    });
   }
 
   // 列表里取消个体：群内还有别的被勾个体就保持兽群勾选，一只不剩才取消
@@ -1127,9 +996,7 @@
       row.cb,
       selectedRows.some((item) => item.cb === row.cb && item.checked),
     );
-    // 行 DOM 已是用户点出的状态，只需刷新表头与按钮：整表重绘会丢掉焦点
-    updateHeaderInfo();
-    updateListButtons();
+    renderSelectedList();
   }
 
   // 树 → 列表：手动勾选兽群不写入新行（列表只由「筛选并加入列表」写入），
@@ -1171,12 +1038,14 @@
   }
 
   function setSortKey(key) {
-    if (sortKey === key) sortDesc = !sortDesc;
-    else {
-      sortKey = key;
-      sortDesc = true;
-    }
-    renderSelectedList();
+    store.batch((nextState) => {
+      if (nextState.sortKey === key) {
+        nextState.sortDescending = !nextState.sortDescending;
+      } else {
+        nextState.sortKey = key;
+        nextState.sortDescending = true;
+      }
+    });
   }
 
   function clearSelectedRows() {
@@ -1223,24 +1092,16 @@
 
   function refreshSpecies() {
     const names = [
-      ...new Set(groupCache.map((g) => g.name).filter(Boolean)),
+      ...new Set(groupCache.map((group) => group.name).filter(Boolean)),
     ].sort((a, b) => a.localeCompare(b));
-    const prev = selSpecies.value;
+    const selectedSpecies = names.includes(state.selectedSpecies)
+      ? state.selectedSpecies
+      : (names[0] ?? "");
 
-    selSpecies.replaceChildren();
-    if (names.length === 0) {
-      const empty = el("option", "", "暂无数据");
-      empty.value = ""; // 显式空值：按钮可用性看 selSpecies.value 的真假
-      selSpecies.replaceChildren(empty);
-      updateActionControls();
-      status.textContent = "";
-      return;
-    }
-
-    // option 不写 value 时，value 就等于文本
-    selSpecies.replaceChildren(...names.map((name) => el("option", "", name)));
-    if (names.includes(prev)) selSpecies.value = prev;
-    updateActionControls();
+    store.batch((nextState) => {
+      nextState.speciesOptions = names;
+      nextState.selectedSpecies = selectedSpecies;
+    });
     updatePreview();
   }
 
@@ -1250,7 +1111,7 @@
   // 出错时的统一出口：底部给用户一句人话，控制台留完整信息。
   // 带 userMessage 的错误（格式不符、组件未就绪…）消息本身就是给用户看的，优先展示
   function reportProblem(message, error, logMessage = message) {
-    status.textContent = error?.userMessage ?? message;
+    state.statusText = error?.userMessage ?? message;
     logError(logMessage, error);
   }
 
@@ -1261,15 +1122,15 @@
   }
 
   function updatePreview() {
-    const species = selSpecies.value;
+    const species = state.selectedSpecies;
     if (!species) {
-      status.textContent = "";
+      state.statusText = "";
       return;
     }
     const unjudged = unjudgedCount(
       groupCache.filter((group) => group.name === species),
     );
-    status.textContent = unjudged
+    state.statusText = unjudged
       ? `有 ${unjudged} 群缺少个体数据，无法判断是否命中，不会勾选`
       : "";
   }
@@ -1292,25 +1153,26 @@
       .find((cb) => populationName(cb) === species)
       ?.closest("li");
     if (!popRow) return;
-    $$(".nav-caret", popRow).forEach((caret) =>
-      caret.classList.add("nav-caret-down"),
-    );
-    $$("ul.nested", popRow).forEach((list) => list.classList.add("active"));
+    popRow
+      .querySelectorAll(".nav-caret")
+      .forEach((caret) => caret.classList.add("nav-caret-down"));
+    popRow
+      .querySelectorAll("ul.nested")
+      .forEach((list) => list.classList.add("active"));
   }
 
   async function applyFilter() {
-    if (operationInFlight) return;
+    if (state.busy) return;
     const sourceCache = groupCache;
-    const species = selSpecies.value;
+    const species = state.selectedSpecies;
     const groups = sourceCache.filter((group) => group.name === species);
     if (!groups.length) {
-      status.textContent = "无可用数据";
+      state.statusText = "无可用数据";
       return;
     }
 
     const filter = makeFilter();
-    operationInFlight = true;
-    updateActionControls();
+    state.busy = true;
 
     try {
       const completed = await runBatches(groups, (group, index) => {
@@ -1324,24 +1186,35 @@
           updateHeaderInfo(`筛选中 ${index}/${groups.length}`);
       });
       if (!completed) {
-        status.textContent = "种群列表已更新，请重新筛选";
+        state.statusText = "种群列表已更新，请重新筛选";
         return;
       }
 
       expandSpeciesBranch(species);
-      renderSelectedList();
     } catch (error) {
       reportProblem("筛选失败", error, "应用筛选失败");
     } finally {
-      operationInFlight = false;
-      updateActionControls();
+      store.batch((nextState) => {
+        nextState.busy = false;
+        nextState.selectedRows = selectedRows.map((row) => ({
+          groupKey: groupKeyOf(row.cb),
+          name: row.name,
+          gender: row.gender,
+          score: row.score,
+          weight: row.weight,
+          checked: row.checked,
+        }));
+        nextState.progress = "";
+      });
     }
   }
 
   function clearAll() {
-    if (operationInFlight) return;
+    if (state.busy) return;
     withTreeSyncSuppressed(() =>
-      $$("#pop_nav input.nav-visible").forEach((cb) => setChecked(cb, false)),
+      document
+        .querySelectorAll("#pop_nav input.nav-visible")
+        .forEach((cb) => setChecked(cb, false)),
     );
     selectedRows = [];
     renderSelectedList();
@@ -1413,40 +1286,6 @@
     await transactSaveHandle("readwrite", (store) =>
       store.put(handle, SAVE_HANDLE_KEY),
     );
-  }
-
-  function updateSelectedSaveControls() {
-    const hasSelection = Boolean(selectedSaveHandle);
-    btnSelectSave.hidden = hasSelection;
-    selectedSaveActions.hidden = !hasSelection;
-    updateActionControls();
-  }
-
-  // 条件类控件统一跟着「是否忙碌」禁用
-  const conditionControls = [
-    selSpecies,
-    inpMin,
-    inpMax,
-    inpWeightMin,
-    inpWeightMax,
-    chkMale,
-    chkFemale,
-  ];
-
-  function updateActionControls() {
-    const busy = operationInFlight;
-    conditionControls.forEach((control) => {
-      control.disabled = busy;
-    });
-    selPreset.disabled = busy || presets.length === 0;
-    btnApply.disabled = busy || !selSpecies.value;
-    btnClear.disabled = busy;
-    btnSelectSave.disabled = busy;
-    btnReselectSave.disabled = busy || !selectedSaveHandle;
-    btnRefreshSave.disabled = busy || !selectedSaveHandle;
-    btnSavePreset.disabled = busy;
-    btnDeletePreset.disabled = busy || !selPreset.value;
-    renderSelectedList();
   }
 
   function pageSaveMapping() {
@@ -1543,12 +1382,12 @@
   }
 
   async function chooseSaveFile() {
-    if (operationInFlight) return;
+    if (state.busy) return;
     if (
       !window.isSecureContext ||
       typeof window.showOpenFilePicker !== "function"
     ) {
-      status.textContent = "浏览器不支持文件选择";
+      state.statusText = "浏览器不支持文件选择";
       return;
     }
 
@@ -1557,8 +1396,8 @@
       if (!handle) return;
       validateSaveHandle(handle);
       selectedSaveHandle = handle;
+      state.saveFileName = handle.name;
       saveSelectionVersion += 1;
-      updateSelectedSaveControls();
       try {
         await writeSavedHandle(handle);
       } catch (error) {
@@ -1576,18 +1415,17 @@
 
   async function refreshSelectedSave() {
     const handle = selectedSaveHandle;
-    if (!handle || operationInFlight) return;
+    if (!handle || state.busy) return;
     if (!isPageReadyForSave(handle.name)) {
-      status.textContent = "地图数据尚未就绪";
+      state.statusText = "地图数据尚未就绪";
       return;
     }
 
-    operationInFlight = true;
-    updateActionControls();
+    state.busy = true;
     try {
       const permission = await handle.requestPermission({ mode: "read" });
       if (permission !== "granted") {
-        status.textContent = "未获得读取权限";
+        state.statusText = "未获得读取权限";
         return;
       }
 
@@ -1596,7 +1434,7 @@
       const bytes = new Uint8Array(await file.arrayBuffer());
       const latestFile = await handle.getFile();
       if (saveFileSignature(latestFile) !== signature) {
-        status.textContent = "存档仍在写入，请稍后刷新";
+        state.statusText = "存档仍在写入，请稍后刷新";
         return;
       }
 
@@ -1604,8 +1442,7 @@
     } catch (error) {
       reportProblem("刷新失败", error, "手动刷新存档失败");
     } finally {
-      operationInFlight = false;
-      updateActionControls();
+      state.busy = false;
     }
   }
 
@@ -1621,42 +1458,85 @@
       )
         return;
       selectedSaveHandle = handle;
-      updateSelectedSaveControls();
+      state.saveFileName = handle.name;
     } catch (error) {
       logWarn("无法恢复存档选择", error);
     }
   }
 
-  btnSelectSave.addEventListener("click", () => void chooseSaveFile());
-  btnReselectSave.addEventListener("click", () => void chooseSaveFile());
-  btnRefreshSave.addEventListener("click", () => void refreshSelectedSave());
-
-  btnApply.addEventListener("click", () => void applyFilter());
-  btnClear.addEventListener("click", clearAll);
-  selSpecies.addEventListener("change", updatePreview);
-  [inpMin, inpMax, inpWeightMin, inpWeightMax].forEach((input) =>
-    input.addEventListener("input", () => {
-      resetPresetSelection();
-      updatePreview();
-    }),
-  );
-  [chkMale, chkFemale].forEach((checkbox) =>
-    checkbox.addEventListener("change", () => {
-      resetPresetSelection();
-      updatePreview();
-    }),
-  );
-
-  selPreset.addEventListener("change", () => {
-    const preset = presets.find((item) => item.name === selPreset.value);
-    if (preset) applyPreset(preset);
-    updateActionControls();
+  const actions = Object.freeze({
+    "choose-save": () => void chooseSaveFile(),
+    "refresh-save": () => void refreshSelectedSave(),
+    "apply-filter": () => void applyFilter(),
+    "clear-all": clearAll,
+    "save-preset": openPresetDialog,
+    "delete-preset": deleteSelectedPreset,
+    "cancel-preset": closePresetDialog,
+    "confirm-preset": confirmPresetSave,
+    "select-all": () => setAllRowsChecked(true),
+    "select-none": () => setAllRowsChecked(false),
+    "sort-score": () => setSortKey("score"),
+    "sort-weight": () => setSortKey("weight"),
   });
-  btnSavePreset.addEventListener("click", openPresetDialog);
-  btnDeletePreset.addEventListener("click", deleteSelectedPreset);
-  btnPresetCancel.addEventListener("click", closePresetDialog);
-  btnPresetConfirm.addEventListener("click", confirmPresetSave);
-  inpPresetName.addEventListener("keydown", (event) => {
+
+  function handlePanelClick(event) {
+    const actionElement = event.target.closest?.("[data-action]");
+    if (!actionElement || !panel.contains(actionElement)) return;
+    actions[actionElement.dataset.action]?.(actionElement, event);
+  }
+
+  function handlePanelInput(event) {
+    const input = event.target;
+    if (input.matches?.("[data-filter]")) {
+      const key = input.dataset.filter;
+      store.batch((nextState) => {
+        nextState.filters = { ...state.filters, [key]: input.value };
+        nextState.presetSelection = "";
+        updatePreview();
+      });
+    } else if (input.matches?.("[data-preset-name]")) {
+      state.presetName = input.value;
+    }
+  }
+
+  function handlePanelChange(event) {
+    const control = event.target;
+    if (control.matches?.("[data-species-select]")) {
+      store.batch((nextState) => {
+        nextState.selectedSpecies = control.value;
+        updatePreview();
+      });
+      return;
+    }
+
+    if (control.matches?.("[data-preset-select]")) {
+      const preset = state.presets.find((item) => item.name === control.value);
+      store.batch((nextState) => {
+        nextState.presetSelection = control.value;
+        if (preset) applyPreset(preset);
+        else updatePreview();
+      });
+      return;
+    }
+
+    if (control.matches?.("[data-gender]")) {
+      const gender = control.dataset.gender;
+      store.batch((nextState) => {
+        nextState.filters = { ...state.filters, [gender]: control.checked };
+        nextState.presetSelection = "";
+        updatePreview();
+      });
+      return;
+    }
+
+    if (control.matches?.("[data-row-index]")) {
+      const row = selectedRows[Number(control.dataset.rowIndex)];
+      if (row) toggleRow(row, control.checked);
+    }
+  }
+
+  function handlePanelKeydown(event) {
+    if (!event.target.matches?.("[data-preset-name]")) return;
     if (event.key === "Enter") {
       event.preventDefault();
       confirmPresetSave();
@@ -1664,7 +1544,52 @@
       event.preventDefault();
       closePresetDialog();
     }
-  });
+  }
+
+  function handlePanelPointerDown(event) {
+    if (!event.target.closest?.("[data-drag-handle]")) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const rect = panel.getBoundingClientRect();
+    drag = {
+      dx: event.clientX - rect.left,
+      dy: event.clientY - rect.top,
+      x0: event.clientX,
+      y0: event.clientY,
+      w: rect.width,
+      moved: false,
+    };
+    panel.setPointerCapture(event.pointerId);
+  }
+
+  function handlePanelPointerMove(event) {
+    if (!drag) return;
+    if (
+      !drag.moved &&
+      Math.abs(event.clientX - drag.x0) + Math.abs(event.clientY - drag.y0) <
+        DRAG_THRESHOLD_PX
+    )
+      return;
+    drag.moved = true;
+
+    const left = Math.min(
+      Math.max(0, event.clientX - drag.dx),
+      window.innerWidth - drag.w,
+    );
+    const top = Math.min(
+      Math.max(0, event.clientY - drag.dy),
+      window.innerHeight - DRAG_MIN_VISIBLE_PX,
+    );
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = "auto";
+  }
+
+  function handlePanelPointerUp(event) {
+    if (drag && !drag.moved) state.collapsed = !state.collapsed;
+    drag = null;
+    if (panel.hasPointerCapture(event.pointerId))
+      panel.releasePointerCapture(event.pointerId);
+  }
 
   // —— 树重建（拖入存档 / 切换地图）后重建索引 ——
 
@@ -1710,8 +1635,12 @@
 
   async function onTreeChanged() {
     try {
-      const root = $("#pop_nav");
-      const inputs = $$("#pop_nav input.nav-visible[data-group-index]");
+      const root = document.querySelector("#pop_nav");
+      const inputs = Array.from(
+        document.querySelectorAll(
+          "#pop_nav input.nav-visible[data-group-index]",
+        ),
+      );
       const signatures = inputs.map(groupInputSignature);
       if (isSameTreeAsProcessed(root, inputs, signatures)) return;
       processedTree = { root, version: individualsVersion, inputs, signatures };
@@ -1769,36 +1698,287 @@
     });
   }
 
-  const mapContainer = $("#map_display");
-  attachMapClickListener();
-  if (mapContainer) {
-    // 切换保护区时页面会重建 Leaflet map；等新地图 DOM 就绪后绑定一次。
-    new MutationObserver(attachMapClickListener).observe(mapContainer, {
-      childList: true,
-    });
+  function HeaderView(currentState) {
+    const information = currentState.progress
+      ? currentState.progress
+      : [
+          currentState.selectedRows.length
+            ? `已选 ${currentState.selectedRows.filter((row) => row.checked).length} / ${currentState.selectedRows.length} 只`
+            : "",
+          currentState.saveFileName,
+        ]
+          .filter(Boolean)
+          .join(" ｜ ");
+
+    return `
+      <div id="cotw-filter-header" data-drag-handle>
+        <span>🦌 种群筛选</span>
+        <span id="cotw-header-info">${escapeHtml(information)}</span>
+        <span id="cotw-filter-toggle">${currentState.collapsed ? "+" : "−"}</span>
+      </div>
+    `;
   }
 
-  const dropzone = $("#dropzone");
-  if (dropzone) {
-    new MutationObserver(queueRebuild).observe(dropzone, {
-      childList: true,
-      subtree: true,
-    });
-    // 手动点击树上的兽群勾选框时，同步到列表
-    dropzone.addEventListener("change", onTreeCheckboxChanged);
+  function SelectedIndividualRow({ row, index }) {
+    const gender = GENDER_SYMBOL[row.gender] ?? "?";
+    const weight = Number.isFinite(row.weight)
+      ? `${row.weight.toFixed(1)}kg`
+      : "—";
+    const name = `${row.name} ${gender}`;
+
+    return `
+      <label class="cotw-sel-row" data-group="${escapeHtml(row.groupKey)}">
+        <input id="cotw-selected-row-${index}" type="checkbox" data-row-index="${index}" ${row.checked ? "checked" : ""}>
+        <span class="cotw-sel-name ${genderClass(row.gender)}" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+        <span class="cotw-sel-score">${row.score.toFixed(1)}</span>
+        <span class="cotw-sel-weight">${weight}</span>
+      </label>
+    `;
   }
 
-  btnSelectAll.addEventListener("click", () => setAllRowsChecked(true));
-  btnSelectNone.addEventListener("click", () => setAllRowsChecked(false));
-  btnSortScore.addEventListener("click", () => setSortKey("score"));
-  btnSortWeight.addEventListener("click", () => setSortKey("weight"));
+  function SelectedIndividualsView(currentState) {
+    const rows = currentState.selectedRows
+      .map((row, index) => ({ row, index }))
+      .sort((a, b) => compareRows(a.row, b.row))
+      .map(SelectedIndividualRow)
+      .join("");
+    const hasUnchecked = currentState.selectedRows.some((row) => !row.checked);
+    const hasChecked = currentState.selectedRows.some((row) => row.checked);
+    const disabled = currentState.busy ? "disabled" : "";
 
-  // 恢复上次保存的筛选条件预设
-  presets = loadPresets();
-  refreshPresetOptions();
-  renderSelectedList();
+    return `
+      <div id="cotw-selected-panel">
+        <div class="cotw-selected-toolbar">
+          <button id="cotw-select-all" data-action="select-all" ${disabled} ${!hasUnchecked ? "disabled" : ""}>全选</button>
+          <button id="cotw-select-none" data-action="select-none" ${disabled} ${!hasChecked ? "disabled" : ""}>全不选</button>
+          <span class="cotw-selected-sort">
+            <button id="cotw-sort-score" data-action="sort-score" class="${currentState.sortKey === "score" ? "cotw-sort-active" : ""}" ${disabled}>分数${currentState.sortKey === "score" && !currentState.sortDescending ? "↑" : "↓"}</button>
+            <button id="cotw-sort-weight" data-action="sort-weight" class="${currentState.sortKey === "weight" ? "cotw-sort-active" : ""}" ${disabled}>体重${currentState.sortKey === "weight" && !currentState.sortDescending ? "↑" : "↓"}</button>
+          </span>
+        </div>
+        <div id="cotw-selected-list" data-scroll-key="selected-list">${rows}</div>
+        <div id="cotw-selected-empty" ${currentState.selectedRows.length ? "hidden" : ""}>还没有加入的个体</div>
+      </div>
+    `;
+  }
 
-  hookSaveParser();
-  void onTreeChanged();
-  void restoreSelectedSave();
+  function FilterControlsView(currentState) {
+    const disabled = currentState.busy ? "disabled" : "";
+    const speciesOptions = currentState.speciesOptions.length
+      ? currentState.speciesOptions
+          .map(
+            (name) =>
+              `<option value="${escapeHtml(name)}" ${name === currentState.selectedSpecies ? "selected" : ""}>${escapeHtml(name)}</option>`,
+          )
+          .join("")
+      : '<option value="">暂无数据</option>';
+    const presetOptions = [
+      `<option value="">${currentState.presets.length ? "选择已保存条件" : "暂无保存的条件"}</option>`,
+      ...currentState.presets.map(
+        (preset) =>
+          `<option value="${escapeHtml(preset.name)}" ${preset.name === currentState.presetSelection ? "selected" : ""}>${escapeHtml(preset.name)}</option>`,
+      ),
+    ].join("");
+    const saveControls = currentState.saveFileName
+      ? `
+          <div id="cotw-selected-save-actions">
+            <button id="cotw-reselect-save" class="cotw-secondary" data-action="choose-save" ${disabled}>重新选择存档</button>
+            <button id="cotw-refresh-save" data-action="refresh-save" ${disabled}>刷新存档</button>
+          </div>
+        `
+      : `<button id="cotw-select-save" class="cotw-secondary" data-action="choose-save" ${disabled}>选择存档文件</button>`;
+    const dialog = `
+      <div id="cotw-preset-dialog" class="cotw-preset-dialog" ${currentState.presetDialogOpen ? "" : "hidden"}>
+        <div class="cotw-dialog-card">
+          <div class="cotw-dialog-title">保存筛选条件</div>
+          <input id="cotw-preset-name" data-preset-name data-focus-key="preset-name" type="text" maxlength="20" placeholder="条件名称" value="${escapeHtml(currentState.presetName)}">
+          <div id="cotw-preset-error" class="cotw-dialog-error">${escapeHtml(currentState.presetError)}</div>
+          <div class="cotw-dialog-actions">
+            <button id="cotw-preset-cancel" class="cotw-secondary" data-action="cancel-preset">取消</button>
+            <button id="cotw-preset-confirm" data-action="confirm-preset">保存</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    return `
+      <div id="cotw-filter-body" data-scroll-key="filter-body">
+        ${saveControls}
+        <label>物种</label>
+        <select id="cotw-species" data-species-select data-focus-key="species" ${disabled}>${speciesOptions}</select>
+        <label>筛选条件</label>
+        <div class="cotw-preset-row">
+          <select id="cotw-preset" data-preset-select data-focus-key="preset" ${disabled || !currentState.presets.length ? "disabled" : ""}>${presetOptions}</select>
+          <button id="cotw-preset-save" class="cotw-secondary" data-action="save-preset" ${disabled}>保存</button>
+          <button id="cotw-preset-delete" class="cotw-secondary" data-action="delete-preset" ${disabled || !currentState.presetSelection ? "disabled" : ""}>删除</button>
+        </div>
+        <div class="cotw-range">
+          <div><label>最小分数</label><input id="cotw-min" data-filter="scoreMin" data-focus-key="score-min" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.scoreMin)}" ${disabled}></div>
+          <div><label>最大分数</label><input id="cotw-max" data-filter="scoreMax" data-focus-key="score-max" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.scoreMax)}" ${disabled}></div>
+        </div>
+        <div class="cotw-range">
+          <div><label>最小体重</label><input id="cotw-weight-min" data-filter="weightMin" data-focus-key="weight-min" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.weightMin)}" ${disabled}></div>
+          <div><label>最大体重</label><input id="cotw-weight-max" data-filter="weightMax" data-focus-key="weight-max" type="number" step="0.1" placeholder="不限" value="${escapeHtml(currentState.filters.weightMax)}" ${disabled}></div>
+        </div>
+        <label>性别</label>
+        <div class="cotw-genders">
+          <label><input id="cotw-gender-male" data-gender="male" type="checkbox" ${currentState.filters.male ? "checked" : ""} ${disabled}> 公 ♂</label>
+          <label><input id="cotw-gender-female" data-gender="female" type="checkbox" ${currentState.filters.female ? "checked" : ""} ${disabled}> 母 ♀</label>
+        </div>
+        <button id="cotw-apply" data-action="apply-filter" ${disabled || !currentState.selectedSpecies ? "disabled" : ""}>筛选并加入列表</button>
+        <button id="cotw-clear" class="cotw-secondary" data-action="clear-all" ${disabled}>清空列表</button>
+        <div id="cotw-status">${escapeHtml(currentState.statusText)}</div>
+        ${AreaDetailsView(currentState)}
+        ${dialog}
+      </div>
+    `;
+  }
+
+  function AreaDetailsView(currentState) {
+    const hasContent =
+      currentState.areaEntries.length > 0 || currentState.areaEmptyText;
+    const content = currentState.areaEntries.length
+      ? currentState.areaEntries.map(renderAreaGroupBlock).join("")
+      : currentState.areaEmptyText
+        ? `<div class="cotw-area-empty">${escapeHtml(currentState.areaEmptyText)}</div>`
+        : "";
+
+    return `
+      <div id="cotw-area-info" ${hasContent ? "" : "hidden"}>
+        <div id="cotw-area-results" data-scroll-key="area-results">${content}</div>
+      </div>
+    `;
+  }
+
+  function AppView(currentState) {
+    return `
+      ${HeaderView(currentState)}
+      <div id="cotw-panel-columns" ${currentState.collapsed ? "hidden" : ""}>
+        ${SelectedIndividualsView(currentState)}
+        ${FilterControlsView(currentState)}
+      </div>
+    `;
+  }
+
+  function render() {
+    const activeElement = document.activeElement;
+    const focusId = panel.contains(activeElement) ? activeElement.id : "";
+    const selection =
+      activeElement instanceof HTMLInputElement &&
+      activeElement.type !== "number" &&
+      typeof activeElement.selectionStart === "number"
+        ? [activeElement.selectionStart, activeElement.selectionEnd]
+        : null;
+    const scrollPositions = new Map(
+      [...panel.querySelectorAll("[data-scroll-key]")].map((element) => [
+        element.dataset.scrollKey,
+        element.scrollTop,
+      ]),
+    );
+
+    panel.classList.toggle("collapsed", state.collapsed);
+    panel.innerHTML = AppView(state);
+
+    let nextFocus = null;
+    for (const element of panel.querySelectorAll("[id], [data-scroll-key]")) {
+      if (
+        element.dataset.scrollKey &&
+        scrollPositions.has(element.dataset.scrollKey)
+      )
+        element.scrollTop = scrollPositions.get(element.dataset.scrollKey);
+      if (element.id === focusId) nextFocus = element;
+    }
+
+    nextFocus?.focus({ preventScroll: true });
+    if (selection && nextFocus instanceof HTMLInputElement) {
+      try {
+        nextFocus.setSelectionRange(...selection);
+      } catch {
+        // 某些浏览器输入类型不支持 selection range
+      }
+    }
+  }
+
+  // 应用入口：创建根节点与 Store，绑定事件、观察页面，再启动首次解析。
+  function main() {
+    const style = document.createElement("style");
+    style.textContent = PANEL_CSS;
+    document.head.appendChild(style);
+
+    panel = document.createElement("div");
+    panel.id = "cotw-filter-panel";
+    document.body.appendChild(panel);
+
+    store = createStore(
+      {
+        statusText: "",
+        busy: false,
+        saveFileName: "",
+        progress: "",
+        sortKey: "score",
+        sortDescending: true,
+        collapsed: false,
+        presets: [],
+        presetSelection: "",
+        presetDialogOpen: false,
+        presetName: "",
+        presetError: "",
+        filters: {
+          scoreMin: "",
+          scoreMax: "",
+          weightMin: "",
+          weightMax: "",
+          male: true,
+          female: true,
+        },
+        speciesOptions: [],
+        selectedSpecies: "",
+        selectedRows: [],
+        areaEntries: [],
+        areaEmptyText: "",
+      },
+      render,
+    );
+    state = store.state;
+
+    panel.addEventListener("click", handlePanelClick);
+    panel.addEventListener("input", handlePanelInput);
+    panel.addEventListener("change", handlePanelChange);
+    panel.addEventListener("keydown", handlePanelKeydown);
+    panel.addEventListener("pointerdown", handlePanelPointerDown);
+    panel.addEventListener("pointermove", handlePanelPointerMove);
+    panel.addEventListener("pointerup", handlePanelPointerUp);
+    panel.addEventListener("pointercancel", () => {
+      drag = null;
+    });
+
+    const mapContainer = document.querySelector("#map_display");
+    attachMapClickListener();
+    if (mapContainer) {
+      // 切换保护区时页面会重建 Leaflet map；等新地图 DOM 就绪后绑定一次。
+      new MutationObserver(attachMapClickListener).observe(mapContainer, {
+        childList: true,
+      });
+    }
+
+    const dropzone = document.querySelector("#dropzone");
+    if (dropzone) {
+      new MutationObserver(queueRebuild).observe(dropzone, {
+        childList: true,
+        subtree: true,
+      });
+      // 手动点击树上的兽群勾选框时，同步到列表。
+      dropzone.addEventListener("change", onTreeCheckboxChanged);
+    }
+
+    state.presets = loadPresets();
+    refreshPresetOptions("");
+    renderSelectedList();
+
+    hookSaveParser();
+    void onTreeChanged();
+    void restoreSelectedSave();
+  }
+
+  main();
 })();
